@@ -12,14 +12,18 @@ from config import (
 
 
 class TileMap:
+    # El nodo final del grafo recibe el campus UPSA
+    UPSA_NODE_ID = 8
+
     def __init__(self, seed: int, node_id: int, node_type: str,
                  cols: int = MAP_COLS, rows: int = MAP_ROWS):
         self.cols      = cols
         self.rows      = rows
         self.node_type = node_type
+        self.node_id   = node_id
         self.rng       = random.Random(seed * 9973 + node_id * 31 + 7)
         self.tiles     = [[TILE_GRASS] * cols for _ in range(rows)]
-        self.objects: dict[tuple, str] = {}   # (col, row) -> type string
+        self.objects: dict[tuple, str] = {}
         self.player_start = (cols // 2, rows // 2)
         self.exits: list[tuple] = []
         self._generate()
@@ -45,14 +49,18 @@ class TileMap:
     # ── generation dispatcher ─────────────────────────────────────────────────
 
     def _generate(self):
-        dispatch = {
-            TYPE_VILLAGE:  self._gen_village,
-            TYPE_FOREST:   self._gen_forest,
-            TYPE_CAVE:     self._gen_cave,
-            TYPE_MOUNTAIN: self._gen_mountain,
-            TYPE_LAKE:     self._gen_lake,
-        }
-        dispatch.get(self.node_type, self._gen_forest)()
+        # El nodo final es siempre el campus UPSA
+        if self.node_id == self.UPSA_NODE_ID:
+            self._gen_upsa_campus()
+        else:
+            dispatch = {
+                TYPE_VILLAGE:  self._gen_village,
+                TYPE_FOREST:   self._gen_forest,
+                TYPE_CAVE:     self._gen_cave,
+                TYPE_MOUNTAIN: self._gen_mountain,
+                TYPE_LAKE:     self._gen_lake,
+            }
+            dispatch.get(self.node_type, self._gen_forest)()
         self._add_exits()
         self._add_chests()
         self._add_enemies()
@@ -122,18 +130,31 @@ class TileMap:
             if self.is_walkable(gx, gy):
                 self.objects[(gx, gy)] = "garden"
 
-        # ── Tienda (edificio especial con $) ─────────────────────────────────
-        sx_, sy_ = cx+3, cy-6
-        sx_ = max(3, min(self.cols-9, sx_))
-        sy_ = max(3, min(self.rows-7, sy_))
-        for r in range(sy_, sy_+5):
-            for c in range(sx_, sx_+7):
-                self.tiles[r][c] = TILE_WALL
-        for r in range(sy_+1, sy_+4):
-            for c in range(sx_+1, sx_+6):
-                self.tiles[r][c] = TILE_FLOOR
-        self.tiles[sy_+4][sx_+3] = TILE_FLOOR  # door
-        self.objects[(sx_+3, sy_+2)] = "shop"
+        # ── 3 Tiendas distribuidas por la aldea ──────────────────────────────
+        shop_defs = [
+            # (offset_x, offset_y)  — relativo al centro
+            ( 3, -6),    # tienda general (noreste del centro)
+            (-14,  6),   # tienda de items (suroeste)
+            ( 12,  7),   # tienda de pociones (sureste)
+        ]
+        for sdx, sdy in shop_defs:
+            sx_ = max(3, min(self.cols-9, cx+sdx))
+            sy_ = max(3, min(self.rows-8, cy+sdy))
+            # Edificio de la tienda (6 de ancho x 5 de alto)
+            for r in range(sy_, sy_+5):
+                for c in range(sx_, sx_+6):
+                    self.tiles[r][c] = TILE_WALL
+            for r in range(sy_+1, sy_+4):
+                for c in range(sx_+1, sx_+5):
+                    self.tiles[r][c] = TILE_FLOOR
+            self.tiles[sy_+4][sx_+2] = TILE_FLOOR   # puerta
+            self.tiles[sy_+4][sx_+3] = TILE_FLOOR
+            # El tile de la tienda va en el FRENTE accesible
+            shop_c = sx_+2
+            shop_r = sy_+4
+            self.tiles[shop_r][shop_c] = TILE_FLOOR
+            if (shop_c, shop_r) not in self.objects:
+                self.objects[(shop_c, shop_r)] = "shop"
 
         # ── NPCs ─────────────────────────────────────────────────────────────
         npc_spots = [(cx-4, cy-4), (cx+4, cy+3), (cx-3, cy+4), (cx+5, cy-3)]
@@ -145,21 +166,168 @@ class TileMap:
 
         self.player_start = (cx - 4, cy + 4)
 
-    def _gen_forest(self):
-        # Dense trees — two winding paths through the forest
+    # ── Campus UPSA (nodo final) ───────────────────────────────────────────────
+
+    def _gen_upsa_campus(self):
+        """
+        Campus estilizado de la UPSA — Universidad Privada de Santa Cruz.
+        Layout: edificio central grande + aulas laterales + plaza + jardines.
+        """
+        cx, cy = self.cols // 2, self.rows // 2
+
+        # ── Piso base: pasto y caminos de arena ───────────────────────────────
         for r in range(self.rows):
             for c in range(self.cols):
-                if self.rng.random() < 0.40:
+                self.tiles[r][c] = TILE_GRASS
+
+        # Avenida principal (horizontal) y secundaria (vertical)
+        for c in range(self.cols):
+            for dr in range(-1, 2):
+                self._safe_set(cy + dr, c, TILE_SAND)
+        for r in range(self.rows):
+            for dc in range(-1, 2):
+                self._safe_set(r, cx + dc, TILE_SAND)
+
+        # ── Edificio principal UPSA (grande, centro-norte) ────────────────────
+        mx, my = cx - 8, cy - 14
+        mw, mh = 16, 10
+        mx = max(3, min(self.cols - mw - 3, mx))
+        my = max(3, min(self.rows - mh - 3, my))
+        for r in range(my, my + mh):
+            for c in range(mx, mx + mw):
+                self.tiles[r][c] = TILE_WALL
+        for r in range(my + 1, my + mh - 1):
+            for c in range(mx + 1, mx + mw - 1):
+                self.tiles[r][c] = TILE_FLOOR
+        # Puertas principales (3 puertas)
+        for dc in (-3, 0, 3):
+            self._safe_set(my + mh - 1, mx + mw // 2 + dc, TILE_SAND)
+        # Cartel UPSA en la entrada
+        self.objects[(mx + mw // 2, my + 1)] = "upsa_sign"
+
+        # ── Aula izquierda (Facultad de Derecho) ─────────────────────────────
+        ax, ay = cx - 22, cy - 10
+        ax = max(3, min(self.cols - 12, ax))
+        ay = max(3, min(self.rows - 9, ay))
+        self._build_room(ax, ay, 9, 7, door='S')
+
+        # ── Aula derecha (Facultad de Ingeniería) ────────────────────────────
+        bx, by = cx + 13, cy - 10
+        bx = max(3, min(self.cols - 12, bx))
+        by = max(3, min(self.rows - 9, by))
+        self._build_room(bx, by, 9, 7, door='S')
+
+        # ── Biblioteca (sur-izquierda) ───────────────────────────────────────
+        lx, ly = cx - 20, cy + 5
+        lx = max(3, min(self.cols - 13, lx))
+        ly = max(3, min(self.rows - 9, ly))
+        self._build_room(lx, ly, 11, 7, door='N')
+        # Marcamos como biblioteca
+        self.objects[(lx + 5, ly + 3)] = "npc_elder"   # bibliotecario
+
+        # ── Cafetería (sur-derecha, tiene tienda) ────────────────────────────
+        rx, ry = cx + 10, cy + 5
+        rx = max(3, min(self.cols - 12, rx))
+        ry = max(3, min(self.rows - 9, ry))
+        self._build_room(rx, ry, 10, 7, door='N')
+        self.objects[(rx + 4, ry + 3)] = "shop"         # cafetería = tienda
+
+        # ── Plaza central con fuente ─────────────────────────────────────────
+        for dr in range(-3, 4):
+            for dc in range(-3, 4):
+                if dr*dr + dc*dc <= 9:
+                    self._safe_set(cy + dr, cx + dc, TILE_SAND)
+        self.objects[(cx, cy)] = "well"   # fuente central
+
+        # ── Jardines con flores ──────────────────────────────────────────────
+        for gx, gy in [(cx-8, cy+3), (cx+6, cy+3),
+                        (cx-8, cy-3), (cx+6, cy-3)]:
+            gx2 = max(0, min(self.cols - 2, gx))
+            gy2 = max(0, min(self.rows - 2, gy))
+            if self.is_walkable(gx2, gy2):
+                self.objects[(gx2, gy2)] = "garden"
+
+        # ── Cancha deportiva (sur, rectángulo de arena) ──────────────────────
+        fx, fy = cx - 6, cy + 14
+        fx = max(3, min(self.cols - 16, fx))
+        fy = max(3, min(self.rows - 8, fy))
+        for r in range(fy, min(fy + 6, self.rows - 2)):
+            for c in range(fx, min(fx + 14, self.cols - 2)):
+                self.tiles[r][c] = TILE_SAND
+        # Marcas de la cancha
+        for c in range(fx + 1, fx + 13):
+            self._safe_set(fy, c, TILE_FLOOR)
+            self._safe_set(fy + 5, c, TILE_FLOOR)
+        for r in range(fy, fy + 6):
+            self._safe_set(r, fx, TILE_FLOOR)
+            self._safe_set(r, fx + 13, TILE_FLOOR)
+        self._safe_set(fy + 2, fx + 6, TILE_WALL)   # arco izq
+        self._safe_set(fy + 2, fx + 7, TILE_WALL)   # arco der
+
+        # ── NPCs (estudiantes) ────────────────────────────────────────────────
+        for nc, nr in [(cx-3, cy-6), (cx+3, cy-6), (cx-2, cy+6), (cx+4, cy+6)]:
+            nc2 = max(0, min(self.cols-1, nc))
+            nr2 = max(0, min(self.rows-1, nr))
+            if self.is_walkable(nc2, nr2) and (nc2, nr2) not in self.objects:
+                self.objects[(nc2, nr2)] = "npc"
+
+        npc_guard_spots = [(mx - 1, my + mh), (mx + mw, my + mh)]
+        for gc, gr in npc_guard_spots:
+            gc2 = max(0, min(self.cols-1, gc))
+            gr2 = max(0, min(self.rows-1, gr))
+            if self.is_walkable(gc2, gr2) and (gc2, gr2) not in self.objects:
+                self.objects[(gc2, gr2)] = "npc_guard"
+
+        self.player_start = (cx - 2, cy + 3)   # llegan frente a la plaza
+
+    def _build_room(self, bx, by, bw, bh, door='S'):
+        """Helper: construye un edificio rectangular con piso y puerta."""
+        bx = max(2, min(self.cols - bw - 2, bx))
+        by = max(2, min(self.rows - bh - 2, by))
+        for r in range(by, by + bh):
+            for c in range(bx, bx + bw):
+                self.tiles[r][c] = TILE_WALL
+        for r in range(by + 1, by + bh - 1):
+            for c in range(bx + 1, bx + bw - 1):
+                self.tiles[r][c] = TILE_FLOOR
+        if door == 'S':
+            self._safe_set(by + bh - 1, bx + bw // 2, TILE_FLOOR)
+        elif door == 'N':
+            self._safe_set(by, bx + bw // 2, TILE_FLOOR)
+        elif door == 'E':
+            self._safe_set(by + bh // 2, bx + bw - 1, TILE_FLOOR)
+        elif door == 'W':
+            self._safe_set(by + bh // 2, bx, TILE_FLOOR)
+
+    def _gen_forest(self):
+        # Bosque respirable: densidad reducida + claros naturales + 3 senderos
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if self.rng.random() < 0.26:   # antes 0.40 — menos sofocante
                     self.tiles[r][c] = TILE_TREE
-        for path_col_start in [self.cols // 5, self.cols * 3 // 5]:
-            pc = path_col_start
+
+        # Claros naturales (círculos sin árboles para respirar)
+        n_clearings = self.rng.randint(4, 7)
+        for _ in range(n_clearings):
+            cc = self.rng.randint(8, self.cols - 8)
+            cr = self.rng.randint(4, self.rows - 4)
+            rad = self.rng.randint(3, 5)
+            for dr in range(-rad, rad+1):
+                for dc in range(-rad, rad+1):
+                    if dr*dr + dc*dc <= rad*rad:
+                        self._safe_set(cr+dr, cc+dc, TILE_GRASS)
+
+        # Tres senderos que cruzan el bosque (más espacio para caminar)
+        for path_start in [self.cols//6, self.cols//2, self.cols*5//6]:
+            pc = path_start
             for r in range(self.rows):
-                for dc in range(4):
-                    nc = max(0, min(self.cols - 1, pc + dc))
+                for dc in range(5):   # ancho 5 (antes 4)
+                    nc = max(0, min(self.cols-1, pc+dc))
                     self.tiles[r][nc] = TILE_GRASS
                 pc += self.rng.randint(-1, 1)
-                pc = max(2, min(self.cols - 6, pc))
-        self.player_start = (self.cols // 5 + 2, self.rows - 4)
+                pc = max(2, min(self.cols-7, pc))
+
+        self.player_start = (self.cols // 6 + 2, self.rows - 4)
 
     def _gen_cave(self):
         # Cellular automata cave
@@ -271,7 +439,8 @@ class TileMap:
                     break
 
     def _add_enemies(self):
-        if self.node_type == TYPE_VILLAGE:
+        # La UPSA y las aldeas son zonas seguras — sin enemigos
+        if self.node_type == TYPE_VILLAGE or self.node_id == self.UPSA_NODE_ID:
             return
         n = {"forest": 5, "cave": 6, "mountain": 6, "lake": 4}.get(self.node_type, 5)
         count = self.rng.randint(max(2, n - 1), n + 2)

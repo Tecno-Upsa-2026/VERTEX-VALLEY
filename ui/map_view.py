@@ -49,11 +49,11 @@ def draw_character(surf, cx, foot_y, anim_t, is_moving, facing=(0,1),
     sc  = shirt_col or _SHIRT_DEFAULT
     hc  = hair_col  or _HAIR_DEFAULT
     pc  = pants_col or _PANTS_DEFAULT
-    frame = int(anim_t * 7) % 4 if is_moving else 0
-    bob   = [0, -1, 0,  1][frame] if is_moving else 0
-    L_STRIDE = [(3,-3),(0,0),(-3,3),(0,0)]
+    frame = int(anim_t * 8) % 4 if is_moving else 0
+    bob   = [0, -3, 0,  3][frame] if is_moving else 0   # más pronunciado
+    L_STRIDE = [(6,-6),(0,0),(-6,6),(0,0)]              # piernas más separadas
     lsd, rsd  = L_STRIDE[frame] if is_moving else (0, 0)
-    A_SWING   = [(-3,3),(0,0),(3,-3),(0,0)]
+    A_SWING   = [(-5,5),(0,0),(5,-5),(0,0)]              # brazos más amplios
     las, ras  = A_SWING[frame] if is_moving else (0, 0)
     fy = foot_y + bob
     shad = pygame.Surface((24, 8), pygame.SRCALPHA)
@@ -309,7 +309,33 @@ class MapView:
                        shirt_col=getattr(player,'shirt_col',None),
                        hair_col =getattr(player,'hair_col', None),
                        pants_col=getattr(player,'pants_col',None))
+
+        # Atmospheric overlay for corridors (scary red vignette + fog)
+        if getattr(tile_map, 'is_corridor', False):
+            self._corridor_atmosphere(s, vp)
+
         s.set_clip(None)
+
+    def _corridor_atmosphere(self, s, vp):
+        """Rojo pulsante en los bordes del corredor para sensación de peligro."""
+        t = self._t
+        pulse = (math.sin(t*1.6)+1)/2
+        alpha = int(18 + pulse*28)
+        vig   = pygame.Surface((vp.width, vp.height), pygame.SRCALPHA)
+        for d in range(90, 0, -22):
+            a2 = int(alpha*(1-d/90))
+            pygame.draw.rect(vig,(180,10,10,a2),(0,0,d,vp.height))
+            pygame.draw.rect(vig,(180,10,10,a2),(vp.width-d,0,d,vp.height))
+        s.blit(vig,(vp.x,vp.y))
+        # Niebla baja en el suelo
+        for i in range(5):
+            phase = t*0.4 + i*0.9
+            fx = vp.x + int((math.sin(phase)*0.35+0.5)*vp.width)
+            fy = vp.y + vp.height - 20 + int(math.sin(phase*1.2)*8)
+            fs = pygame.Surface((50,18),pygame.SRCALPHA)
+            fa = int(12+math.sin(phase*2)*5)
+            pygame.draw.ellipse(fs,(30,25,40,fa),fs.get_rect())
+            s.blit(fs,(fx-25,fy-9))
 
     # ── tile renderer ─────────────────────────────────────────────────────────
 
@@ -430,6 +456,7 @@ class MapView:
         elif obj == "npc_guard": draw_npc(s, cx_, cy_+2, color=(80,120,200), t=t)
         elif obj == "well":      self._well(s, sx, sy)
         elif obj == "garden":    self._garden(s, sx, sy, t)
+        elif obj == "upsa_sign": self._upsa_sign(s, sx, sy, t)
 
     def _chest(self, s, sx, sy, t):
         sh=pygame.Surface((26,8),pygame.SRCALPHA); pygame.draw.ellipse(sh,(0,0,0,60),sh.get_rect())
@@ -453,9 +480,53 @@ class MapView:
         at=self.F["xs"].render(">>",True,(120,230,170)); s.blit(at,at.get_rect(center=(sx+half,sy+14)))
 
     def _shop(self, s, sx, sy, half):
-        _r(s,(142,90,26),sx+5,sy+3,22,22,3)
-        pygame.draw.rect(s,(195,145,58),(sx+5,sy+3,22,22),2,border_radius=3)
-        gt=self.F["md"].render("$",True,(255,220,60)); s.blit(gt,gt.get_rect(center=(sx+half,sy+half-1)))
+        """Tiendita con toldo a rayas, vitrinas y puerta."""
+        t = self._t
+
+        # ── Pared de la tienda ────────────────────────────────────────────────
+        _r(s, (140, 105, 72), sx+1, sy+8, 30, 22)   # paredes beige-marrón
+        _r(s, (120,  88, 58), sx+1, sy+8,  2, 22)   # sombra lateral izq
+        _r(s, (120,  88, 58), sx+1, sy+28, 30,  2)  # sombra inferior
+
+        # ── Toldo con rayas rojo-amarillo ─────────────────────────────────────
+        stripe_w = 4
+        colors   = [(210, 45, 38), (245, 210, 60)]
+        for i in range(8):
+            _r(s, colors[i % 2], sx + i*stripe_w, sy+2, stripe_w, 7)
+        # Borde del toldo
+        pygame.draw.rect(s, (160, 28, 22), (sx, sy+2, T, 7), 1)
+        # Flecos del toldo (pequeños triángulos colgantes)
+        for fx in range(sx+2, sx+T-1, 5):
+            pygame.draw.polygon(s, (185, 35, 28), [(fx, sy+9),(fx+2,sy+12),(fx+4,sy+9)])
+
+        # ── Cartel con "$" y nombre ───────────────────────────────────────────
+        _r(s, (255, 215, 40), sx+8, sy+3, 16, 5, 1)  # fondo cartel dorado
+        pygame.draw.rect(s, (180, 138, 15), (sx+8, sy+3, 16, 5), 1, border_radius=1)
+        gt = self.F["xs"].render("$", True, (55, 28, 4))
+        s.blit(gt, gt.get_rect(center=(sx+half, sy+6)))
+
+        # ── Ventana izquierda ─────────────────────────────────────────────────
+        _r(s, (155, 210, 240), sx+3, sy+11, 9, 9)
+        pygame.draw.line(s, (100, 165, 205), (sx+7, sy+11), (sx+7, sy+20), 1)
+        pygame.draw.line(s, (100, 165, 205), (sx+3, sy+15), (sx+12, sy+15), 1)
+        pygame.draw.rect(s, (90, 62, 35), (sx+3, sy+11, 9, 9), 1)
+
+        # ── Ventana derecha ───────────────────────────────────────────────────
+        _r(s, (155, 210, 240), sx+20, sy+11, 9, 9)
+        pygame.draw.line(s, (100, 165, 205), (sx+24, sy+11), (sx+24, sy+20), 1)
+        pygame.draw.line(s, (100, 165, 205), (sx+20, sy+15), (sx+29, sy+15), 1)
+        pygame.draw.rect(s, (90, 62, 35), (sx+20, sy+11, 9, 9), 1)
+
+        # ── Puerta central ────────────────────────────────────────────────────
+        _r(s, (88, 56, 30), sx+12, sy+20, 8, 10, 1)    # puerta
+        pygame.draw.circle(s, (200, 160, 48), (sx+18, sy+26), 1)  # pomo
+
+        # ── Brillo animado en vitrinas ────────────────────────────────────────
+        pulse = (math.sin(t * 2.5) + 1) / 2
+        sh    = pygame.Surface((6, 5), pygame.SRCALPHA)
+        sh.fill((230, 248, 255, int(25 + pulse*22)))
+        s.blit(sh, (sx+4, sy+12))
+        s.blit(sh, (sx+21, sy+12))
 
     def _well(self, s, sx, sy):
         """Pozo de piedra."""
@@ -476,3 +547,23 @@ class MapView:
             fc=rng.choice([(255,218,80),(255,130,180),(180,145,255)])
             pygame.draw.circle(s,fc,(fx,fy),3)
             pygame.draw.circle(s,(255,255,200),(fx,fy),1)
+
+    def _upsa_sign(self, s, sx, sy, t):
+        """Cartel luminoso de la UPSA sobre el edificio principal."""
+        half = T // 2
+        # Fondo del cartel (azul institucional UPSA)
+        UPSA_BLUE = (0, 60, 140)
+        UPSA_GOLD = (255, 200, 30)
+        _r(s, UPSA_BLUE, sx+2, sy+4, 28, 22, 3)
+        pygame.draw.rect(s, UPSA_GOLD, (sx+2, sy+4, 28, 22), 2, border_radius=3)
+        # Texto UPSA
+        ut = self.F["xs"].render("UPSA", True, UPSA_GOLD)
+        s.blit(ut, ut.get_rect(center=(sx+half, sy+12)))
+        # Subtexto pequeño
+        sub = self.F["xs"].render("Univ.", True, (200, 220, 255))
+        s.blit(sub, sub.get_rect(center=(sx+half, sy+22)))
+        # Brillo pulsante
+        pulse = (math.sin(t*2)+1)/2
+        gs = pygame.Surface((32, 28), pygame.SRCALPHA)
+        pygame.draw.rect(gs, (*UPSA_GOLD, int(20+pulse*25)), gs.get_rect(), border_radius=4)
+        s.blit(gs, (sx, sy+3))

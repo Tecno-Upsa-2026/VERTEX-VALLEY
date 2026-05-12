@@ -128,10 +128,18 @@ class Game:
         self._fullscreen = False
         self.clock  = pygame.time.Clock()
         self.fonts  = load_fonts()
-        self._seed_input   = ""
-        self._selected_char = 0          # index into CHARACTERS list
+        self._seed_input    = ""
+        self._selected_char = 0
         self._chosen_char   = CHARACTERS[0]
-        self._ds_panel_open = False      # toggle with H
+        self._ds_panel_open = False
+
+        # ── Audio ──────────────────────────────────────────────────────────────
+        import sounds as _snd
+        self._sfx       = _snd.init()   # dict or None if unavailable
+        self._cur_music = None          # track name currently playing
+        if self._sfx:
+            self._play_music('village')
+
         self._setup_new_game(random.randint(1000, 9999))
 
     def toggle_fullscreen(self):
@@ -188,6 +196,16 @@ class Game:
         self._MOVE_DAS       = 0.20
         self._MOVE_ARR       = 0.07
 
+        # ── Combat-on-map system ──────────────────────────────────────────────────
+        self._map_enemies:  dict  = {}   # (c,r) -> Enemy — HP persistente entre hits
+        self._hit_effects:  list  = []   # números de daño flotantes
+        self._hurt_tiles:   list  = []   # [(tc,tr,timer,color)] flashes de daño
+
+        # ── Walk particles ─────────────────────────────────────────────────────
+        self._walk_particles:  list  = []
+        self._footstep_timer:  float = 0.0
+        self._enemy_move_timer: float = 0.0  # mover en TODOS los mapas
+
     def _load_node(self, node_id: int):
         node = self.graph.nodes[node_id]
         node.visited = True
@@ -195,6 +213,8 @@ class Game:
         px, py = self.tile_map.player_start
         self.player.x, self.player.y = px, py
         self._opened_objects = set()
+        self._map_enemies    = {}    # clear enemy HP tracking on new map
+        self._hit_effects    = []
         self.current_node_id = node_id
 
     # ── main loop ─────────────────────────────────────────────────────────────
@@ -255,21 +275,19 @@ class Game:
     def _ev_char_select(self, e: pygame.event.Event):
         if e.type != pygame.KEYDOWN:
             return
+        # Block input while animation plays
+        if getattr(self, '_char_select_anim', None):
+            return
         if e.key in (pygame.K_LEFT, pygame.K_a):
             self._selected_char = (self._selected_char - 1) % len(CHARACTERS)
         if e.key in (pygame.K_RIGHT, pygame.K_d):
             self._selected_char = (self._selected_char + 1) % len(CHARACTERS)
         if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
-            self._chosen_char = CHARACTERS[self._selected_char]
+            # Save chosen character and pending seed — setup happens AFTER animation
+            self._chosen_char    = CHARACTERS[self._selected_char]
             seed_str = self.state_data.get("seed_input", "")
-            seed = int(seed_str) if seed_str.isdigit() else random.randint(1000, 9999)
-            self._setup_new_game(seed)
-            # Give starting item
-            start_item = self._chosen_char.get("item")
-            if start_item:
-                self.player.add_item(start_item)
-                self.player.use_item(start_item)
-            self.state = STATE_EXPLORE
+            self._pending_seed   = int(seed_str) if seed_str.isdigit() else random.randint(1000, 9999)
+            self._char_select_anim = {"timer": 2.2, "max": 2.2}
         if e.key == pygame.K_ESCAPE:
             self.state = STATE_TITLE
 
@@ -311,7 +329,7 @@ class Game:
             self._try_interact()
         if key == pygame.K_k:
             # K = atacar monstruo adyacente
-            self._attack_adjacent_monster()
+            self._quick_attack()
         if key == pygame.K_e:
             self.state_data["show_inv"] = not self.state_data.get("show_inv", False)
         if key == pygame.K_q:
@@ -377,32 +395,67 @@ class Game:
             n["t"] -= dt
         self._notifs = [n for n in self._notifs if n["t"] > 0]
 
+        # Tick hit effects (floating damage numbers + burst)
+        for ef in self._hit_effects:
+            ef["t"] -= dt
+        self._hit_effects = [ef for ef in self._hit_effects if ef["t"] > 0]
+
+        # Tick character select animation and transition when done
+        if self.state == STATE_CHAR_SELECT:
+            anim = getattr(self, '_char_select_anim', None)
+            if anim:
+                anim["timer"] -= dt
+                if anim["timer"] <= 0:
+                    self._char_select_anim = None
+                    self._setup_new_game(self._pending_seed)
+                    start_item = self._chosen_char.get("item")
+                    if start_item:
+                        self.player.add_item(start_item)
+                        self.player.use_item(start_item)
+                    self.state = STATE_EXPLORE
+
         if self.state == STATE_DIJKSTRA:
             self._update_dijkstra(dt)
 
         if self.state == STATE_EXPLORE:
             self._update_movement(dt)
-            self._update_corridor_enemies(dt)
+            self._update_map_enemies(dt)    # todos los mapas, no solo corredor
+            self._update_music()
+            # Walk particles
+            for p in self._walk_particles:
+                p['life'] -= dt
+                p['oy']   += p['voy'] * dt * 60
+                p['ox']   += p['vox'] * dt * 30
+            self._walk_particles = [p for p in self._walk_particles if p['life'] > 0]
+            # Hurt tile flashes (enemy hit / player hit)
+            for h in self._hurt_tiles:
+                h[2] -= dt
+            self._hurt_tiles = [h for h in self._hurt_tiles if h[2] > 0]
 
-    def _update_corridor_enemies(self, dt: float):
-        """Move enemies toward the player every 0.65s while in a corridor."""
-        if not getattr(self.tile_map, 'is_corridor', False):
-            return
+    def _update_map_enemies(self, dt: float):
+        """
+        Mueve los monstruos hacia el jugador en CUALQUIER mapa.
+        Aggro range: 12 tiles. Intervalo: 0.6s.
+        Cuando alcanza al jugador → auto-ataque directo (sin menú).
+        """
         self._enemy_move_timer += dt
-        if self._enemy_move_timer < 0.65:
+        interval = 0.5 if getattr(self.tile_map, 'is_corridor', False) else 0.75
+        if self._enemy_move_timer < interval:
             return
         self._enemy_move_timer = 0.0
 
-        px, py   = self.player.x, self.player.y
-        enemies  = [(c, r) for (c, r), obj in list(self.tile_map.objects.items())
-                    if obj == 'enemy']
+        px, py  = self.player.x, self.player.y
+        enemies = [(c, r) for (c, r), obj in list(self.tile_map.objects.items())
+                   if obj == 'enemy']
 
         for ec, er in enemies:
+            dist = abs(ec - px) + abs(er - py)
+            if dist > 12:
+                continue   # fuera del rango de aggro
+
             dc = 1 if px > ec else (-1 if px < ec else 0)
             dr = 1 if py > er else (-1 if py < er else 0)
 
-            # Try horizontal first (corridor is horizontal), then vertical
-            moved = False
             for tdc, tdr in [(dc, 0), (0, dr), (dc, dr)]:
                 if tdc == 0 and tdr == 0:
                     continue
@@ -410,17 +463,45 @@ class Game:
                 if not self.tile_map.is_walkable(nc, nr):
                     continue
                 if self.tile_map.get_object(nc, nr) == 'enemy':
-                    continue  # blocked by another enemy
-                # Move the enemy
+                    continue
                 self.tile_map.objects.pop((ec, er))
                 if nc == px and nr == py:
-                    # Reached the player — trigger combat
+                    # Alcanzó al jugador — ataque automático directo en el mapa
                     self.tile_map.objects[(nc, nr)] = 'enemy'
-                    self._start_node_combat(nc, nr)
-                    return   # only one combat at a time
+                    self._enemy_auto_attack(nc, nr)
+                    return
                 self.tile_map.objects[(nc, nr)] = 'enemy'
-                moved = True
                 break
+
+    # mantenemos alias para no romper referencias antiguas
+    _update_corridor_enemies = _update_map_enemies
+
+    def _enemy_auto_attack(self, ec: int, er: int):
+        """El monstruo alcanza al jugador y lo golpea directamente."""
+        ntype = getattr(self.tile_map, 'node_type',
+                        self.graph.nodes[self.current_node_id].type)
+        key = (ec, er)
+        if key not in self._map_enemies:
+            self._map_enemies[key] = make_enemy(ntype, 1.0 + self.player.level * 0.08)
+
+        enemy = self._map_enemies[key]
+        raw   = enemy.deal_damage()
+        dmg   = self.player.take_damage(raw)
+        self._play_sfx('hit_player')
+        self.combat_ui._shake = 0.14
+
+        # Número de daño sobre el jugador
+        vp   = self.map_view.viewport
+        px_s = vp.x + (self.player.x - self.map_view.cam_c)*TILE_SIZE + TILE_SIZE//2
+        py_s = vp.y + (self.player.y - self.map_view.cam_r)*TILE_SIZE - 4
+        self._hit_effects.append({"x": px_s, "y": py_s, "dmg": dmg,
+                                   "col": C["red"], "t": 1.2, "max": 1.2})
+        # Flash rojo en el tile del jugador
+        self._hurt_tiles.append([self.player.x, self.player.y, 0.28, (220, 40, 40)])
+
+        self._notify(f"  {enemy.name} te ataca: -{dmg} HP", C["red"], 1.0)
+        if not self.player.is_alive():
+            self.state = STATE_GAME_OVER
 
     def _update_movement(self, dt: float):
         """DAS (Delayed Auto Shift) continuous movement while key is held."""
@@ -467,6 +548,150 @@ class Game:
         moved = self.player.move(dx, dy, self.tile_map)
         if moved:
             self._check_tile_interaction()
+            self._spawn_walk_dust()
+            # Footstep sound every ~2 tiles
+            self._footstep_timer += 1
+            if self._footstep_timer >= 2:
+                self._footstep_timer = 0
+                self._play_sfx('footstep')
+
+    # ── Audio helpers ─────────────────────────────────────────────────────────
+
+    def _play_sfx(self, name: str):
+        if not self._sfx:
+            return
+        try:
+            snd = self._sfx.get(name)
+            if snd:
+                snd.play()
+        except Exception:
+            pass
+
+    def _play_music(self, track: str):
+        if not self._sfx or track == self._cur_music:
+            return
+        try:
+            music_buf = self._sfx['_music'].get(track)
+            if music_buf:
+                music_buf.seek(0)
+                pygame.mixer.music.load(music_buf)
+                pygame.mixer.music.set_volume(0.38)
+                pygame.mixer.music.play(-1)   # loop forever
+                self._cur_music = track
+        except Exception:
+            pass
+
+    def _enemies_nearby(self, radius: int = 7) -> bool:
+        """Retorna True si hay algún enemigo a ≤ radius tiles (distancia Manhattan)."""
+        px, pr = self.player.x, self.player.y
+        for (ec, er), obj in self.tile_map.objects.items():
+            if obj == 'enemy':
+                if abs(ec - px) + abs(er - pr) <= radius:
+                    return True
+        # También cuenta los enemigos persistentes del sistema K-attack
+        for (ec, er) in self._map_enemies:
+            if abs(ec - px) + abs(er - pr) <= radius:
+                return True
+        return False
+
+    def _update_music(self):
+        """
+        Música dinámica de 3 niveles:
+          danger  — enemigo a ≤ 7 tiles (terror, tempo alto, disonante)
+          dungeon — corredor / cueva / montaña  (oscuro)
+          village — aldea / bosque / lago       (alegre)
+        """
+        if not self._sfx:
+            return
+        if self._enemies_nearby(7):
+            self._play_music('danger')
+            return
+        in_corridor = getattr(self.tile_map, 'is_corridor', False)
+        ntype = getattr(self.tile_map, 'node_type',
+                        self.graph.nodes[self.current_node_id].type)
+        dark = in_corridor or ntype in ('cave', 'mountain')
+        self._play_music('dungeon' if dark else 'village')
+
+    # ── Walk dust particles ────────────────────────────────────────────────────
+
+    def _spawn_walk_dust(self):
+        from config import TILE_GRASS, TILE_SAND, TILE_FLOOR
+        tile = self.tile_map.get_tile(self.player.x, self.player.y)
+        col = {
+            TILE_GRASS: (75, 118, 52),
+            TILE_SAND:  (175, 148, 88),
+            TILE_FLOOR: (90, 80, 70),
+        }.get(tile)
+        if col is None:
+            return
+        for _ in range(4):
+            self._walk_particles.append({
+                'c':   self.player.x, 'r': self.player.y,
+                'ox':  random.uniform(-10, 10),
+                'oy':  random.uniform(-2, 4),
+                'vox': random.uniform(-1.5, 1.5),
+                'voy': random.uniform(-2.0, -0.5),
+                'life': 0.38, 'max': 0.38,
+                'col':  col,
+                'size': random.uniform(2.0, 4.5),
+            })
+
+    def _draw_hurt_tiles(self):
+        """Flash de color sobre el tile golpeado (naranja=enemigo, rojo=jugador)."""
+        s  = self.screen
+        vp = self.map_view.viewport
+        T  = TILE_SIZE
+        for tc, tr, timer, col in self._hurt_tiles:
+            ratio = min(1.0, timer / 0.22)
+            alpha = int(ratio * 175)
+            px_   = vp.x + (tc - self.map_view.cam_c) * T
+            py_   = vp.y + (tr - self.map_view.cam_r) * T
+            if vp.x <= px_ < vp.right and vp.y <= py_ < vp.bottom:
+                hs = pygame.Surface((T, T), pygame.SRCALPHA)
+                hs.fill((*col[:3], alpha))
+                s.blit(hs, (px_, py_))
+
+    def _draw_enemy_hp_bars(self):
+        """Barra de HP sobre cada enemigo que ya fue golpeado al menos una vez."""
+        s  = self.screen
+        vp = self.map_view.viewport
+        T  = TILE_SIZE
+        F  = self.fonts
+        for (ec, er), enemy in self._map_enemies.items():
+            px_  = vp.x + (ec - self.map_view.cam_c)*T + T//2
+            py_  = vp.y + (er - self.map_view.cam_r)*T - 14
+            if not (vp.x < px_ < vp.right and vp.y < py_ < vp.bottom):
+                continue
+
+            bw = 30
+            # Fondo oscuro
+            pygame.draw.rect(s, (20, 8, 8), (px_-bw//2-1, py_-1, bw+2, 7), border_radius=3)
+            # Barra de HP
+            fw = max(0, int(bw * enemy.hp_ratio))
+            if fw:
+                col = (200, 45, 45) if enemy.hp_ratio < 0.3 else \
+                      (230, 140, 30) if enemy.hp_ratio < 0.6 else (60, 190, 70)
+                pygame.draw.rect(s, col, (px_-bw//2, py_, fw, 5), border_radius=3)
+            pygame.draw.rect(s, (180, 80, 80), (px_-bw//2, py_, bw, 5), 1, border_radius=3)
+
+            # Nombre del monstruo (solo visible al ser golpeado)
+            nt = F["xs"].render(enemy.name, True, (220, 170, 170))
+            s.blit(nt, nt.get_rect(center=(px_, py_-8)))
+
+    def _draw_walk_particles(self):
+        s  = self.screen
+        vp = self.map_view.viewport
+        T  = TILE_SIZE
+        for p in self._walk_particles:
+            ratio = p['life'] / p['max']
+            alpha = int(ratio * 160)
+            size  = max(1, int(p['size'] * ratio))
+            px_ = int(vp.x + (p['c'] - self.map_view.cam_c)*T + T//2 + p['ox'])
+            py_ = int(vp.y + (p['r'] - self.map_view.cam_r)*T + T - p['oy'])
+            if vp.x <= px_ < vp.right and vp.y <= py_ < vp.bottom:
+                surf = pygame.Surface((size*2+2, size*2+2), pygame.SRCALPHA)
+                pygame.draw.circle(surf, (*p['col'], alpha), (size+1, size+1), size)
+                s.blit(surf, (px_-size-1, py_-size-1))
 
     def _update_dijkstra(self, dt: float):
         data = self.state_data
@@ -512,21 +737,23 @@ class Game:
 
     # ── Title-screen helpers ──────────────────────────────────────────────────
 
-    def _title_glow(self, s, text, font, col, cx, cy, glow_r=14):
-        """Render text with a multi-pass glow + drop shadow."""
-        ts = font.render(text, True, col)
-        rect = ts.get_rect(center=(cx, cy))
-        # Drop shadow
-        sh = font.render(text, True, (0, 0, 0))
-        s.blit(sh, rect.move(4, 5))
-        # Glow passes (outer → inner)
-        for r in range(glow_r, 2, -3):
-            alpha = int(110 * (1 - r / glow_r))
-            ts.set_alpha(alpha)
-            for dx, dy in [(-r,0),(r,0),(0,-r),(0,r),(-r//2,-r//2),(r//2,r//2)]:
-                s.blit(ts, rect.move(dx, dy))
-        ts.set_alpha(255)
-        s.blit(ts, rect)
+    def _title_glow(self, s, text, font, col, cx, cy, glow_r=7):
+        """
+        Contorno negro puro + texto nítido — SIN glow que tape las letras.
+        El glow rellena los espacios entre letras y las hace ilegibles.
+        """
+        # ── Contorno negro (2-3 px en todas las diagonales) ───────────────────
+        outline = font.render(text, True, (0, 0, 0))
+        for ox, oy in ((-3, 0),(3, 0),(0,-3),(0, 3),
+                       (-2,-2),(2,-2),(-2, 2),(2, 2),
+                       (-3,-1),(3,-1),(-3, 1),(3, 1),
+                       (-1,-3),(1,-3),(-1, 3),(1, 3),
+                       (-2, 0),(2, 0),(0,-2),(0, 2)):
+            s.blit(outline, outline.get_rect(center=(cx+ox, cy+oy)))
+
+        # ── Texto principal — color limpio encima del contorno ────────────────
+        main = font.render(text, True, col)
+        s.blit(main, main.get_rect(center=(cx, cy)))
 
     def _title_bg_graph(self, s, t):
         """Animated floating graph nodes in the background."""
@@ -579,6 +806,61 @@ class Game:
             ring = tuple(min(255, c+65) for c in col[:3])
             pygame.draw.circle(s, ring,       (int(ax), int(ay)), size, 2)
 
+    # ── TecnoUpsa badge ───────────────────────────────────────────────────────
+
+    def _draw_tecnoupsa_badge(self, s, cx, cy):
+        """Corona dorada con #1 encima y 'TecnoUpsa' debajo."""
+        GOLD  = (255, 210,  50)
+        GOLD2 = (220, 170,  20)
+        GOLD3 = (255, 238, 120)
+        BG    = (30,  22,   8)
+
+        # ── Fondo pill ────────────────────────────────────────────────────────
+        pill = pygame.Rect(cx - 52, cy - 4, 104, 60)
+        bg   = pygame.Surface((pill.w, pill.h), pygame.SRCALPHA)
+        bg.fill((20, 14, 4, 210))
+        s.blit(bg, pill.topleft)
+        pygame.draw.rect(s, GOLD2, pill, 2, border_radius=10)
+
+        # ── Corona ────────────────────────────────────────────────────────────
+        # Base de la corona
+        base_r = pygame.Rect(cx - 28, cy + 14, 56, 10)
+        pygame.draw.rect(s, GOLD, base_r, border_radius=3)
+        pygame.draw.rect(s, GOLD2, base_r, 1, border_radius=3)
+
+        # Dientes de la corona (5 picos)
+        crown_pts = [
+            (cx - 28, cy + 15),   # esquina izq base
+            (cx - 28, cy + 2),    # pico izq exterior
+            (cx - 15, cy + 12),   # valle izq-centro
+            (cx - 8,  cy - 6),    # pico izq-centro
+            (cx,      cy + 10),   # valle centro
+            (cx + 8,  cy - 6),    # pico der-centro
+            (cx + 15, cy + 12),   # valle der-centro
+            (cx + 28, cy + 2),    # pico der exterior
+            (cx + 28, cy + 15),   # esquina der base
+        ]
+        pygame.draw.polygon(s, GOLD,  crown_pts)
+        pygame.draw.polygon(s, GOLD2, crown_pts, 1)
+
+        # Brillo en la parte superior de la corona
+        pygame.draw.line(s, GOLD3, (cx - 26, cy + 3), (cx + 26, cy + 3), 1)
+
+        # Joyas en los picos (3 círculos de colores)
+        for jx, jy, jc in ((cx - 8, cy - 4, (255, 90, 90)),
+                            (cx,     cy + 12,(100, 200, 255)),
+                            (cx + 8, cy - 4, (90, 255, 140))):
+            pygame.draw.circle(s, jc, (jx, jy), 3)
+            pygame.draw.circle(s, (255,255,255), (jx-1, jy-1), 1)
+
+        # Número 1 en el centro de la corona
+        n1 = self.fonts["sm"].render("#1", True, (40, 28, 4))
+        s.blit(n1, n1.get_rect(center=(cx, cy + 19)))
+
+        # ── Texto TecnoUpsa ───────────────────────────────────────────────────
+        tu = self.fonts["sm"].render("TecnoUpsa", True, GOLD)
+        s.blit(tu, tu.get_rect(center=(cx, cy + 46)))
+
     # ── Title screen ──────────────────────────────────────────────────────────
 
     def _draw_title(self):
@@ -597,9 +879,25 @@ class Game:
         # Animated graph in background
         self._title_bg_graph(s, t)
 
-        # ── Title "VERTEX VALLEY" with glow ───────────────────────────────────
+        # ── Title "VERTEX VALLEY" ─────────────────────────────────────────────
         title_y = 108
-        self._title_glow(s, "VERTEX VALLEY", self.fonts["title"], C["green"], cx, title_y, glow_r=18)
+        # Panel oscuro detrás del título para contraste contra los nodos animados
+        title_surf = self.fonts["title"].render("VERTEX VALLEY", True, C["green"])
+        tw, th = title_surf.get_size()
+        panel = pygame.Surface((tw + 40, th + 20), pygame.SRCALPHA)
+        panel.fill((0, 0, 0, 140))
+        s.blit(panel, panel.get_rect(center=(cx, title_y)))
+        # Texto con contorno negro nítido
+        self._title_glow(s, "VERTEX VALLEY", self.fonts["title"], C["green"], cx, title_y, glow_r=7)
+
+        # ── TecnoUpsa badge con corona #1 ─────────────────────────────────────
+        title_surf_w = self.fonts["title"].render("VERTEX VALLEY", True, C["green"]).get_width()
+        badge_cx = cx + title_surf_w // 2 + 72
+        badge_cy = title_y - 2
+        if badge_cx + 70 > WIDTH:   # si no cabe a la derecha, va en esquina
+            badge_cx = WIDTH - 78
+            badge_cy = 55
+        self._draw_tecnoupsa_badge(s, badge_cx, badge_cy)
 
         # ── Coloured subtitle words ───────────────────────────────────────────
         sub_y = title_y + 80
@@ -718,14 +1016,24 @@ class Game:
                 s.blit(kt, (cr.x + 12, iy))
                 s.blit(vt, (cr.x + 12 + kt.get_width() + 8, iy))
 
-        # ── Footer ────────────────────────────────────────────────────────────
+        # ── Footer: semilla + créditos ────────────────────────────────────────
         seed_v = self.seed if hasattr(self, "seed") else "?"
-        pygame.draw.line(s, C["border"], (40, HEIGHT-42), (WIDTH-40, HEIGHT-42), 1)
-        ft = self.fonts["xs"].render(
-            f"Semilla actual: {seed_v}    |    "
-            "El mismo numero siempre genera el mismo mundo",
-            True, C["text_dim"])
-        s.blit(ft, ft.get_rect(center=(cx, HEIGHT - 22)))
+        pygame.draw.line(s, C["border"], (40, HEIGHT-60), (WIDTH-40, HEIGHT-60), 1)
+
+        # Semilla (pequeño, izquierda)
+        sv = self.fonts["xs"].render(f"Semilla: {seed_v}", True, C["text_dim"])
+        s.blit(sv, (46, HEIGHT - 52))
+
+        # Créditos de autores (centrado, dos líneas)
+        made = self.fonts["xs"].render("Made by:", True, C["text_dim"])
+        s.blit(made, made.get_rect(center=(cx, HEIGHT - 48)))
+
+        authors1 = self.fonts["sm"].render(
+            "Flavia Lozada Rueda   ·   Ma. Fernanda Sanchez", True, C["text"])
+        authors2 = self.fonts["sm"].render(
+            "Mateo Soto Gareca   ·   Carlos Zambrana", True, C["text"])
+        s.blit(authors1, authors1.get_rect(center=(cx, HEIGHT - 30)))
+        s.blit(authors2, authors2.get_rect(center=(cx, HEIGHT - 12)))
 
     # ── world / dijkstra screens ──────────────────────────────────────────────
 
@@ -823,74 +1131,116 @@ class Game:
         self._draw_mini_hud(s, 30, HEIGHT - 58)
 
     def _draw_tunnel_corridor(self, s, t):
-        """3-D perspective stone corridor — background for the travel screen."""
-        s.fill((8, 6, 5))
+        """Corredor aterrador — piedra oscura, antorchas rojas, niebla verde."""
+        s.fill((4, 3, 3))
         cx, cy = WIDTH // 2, HEIGHT // 2 + 60
 
-        # Vanishing-point rings (back → front)
+        # ── Anillos de perspectiva ────────────────────────────────────────────
         for i in range(10, 0, -1):
             ratio = i / 10.0
-            hw    = int(WIDTH  * 0.52 * ratio)
-            hh    = int(HEIGHT * 0.42 * ratio)
+            hw = int(WIDTH * 0.52 * ratio)
+            hh = int(HEIGHT * 0.42 * ratio)
             x0, y0 = cx - hw, cy - hh
-            br = int(10 + (1 - ratio) * 55)
-            col = (br, br - 2, br - 4)
+            br = int(5 + (1-ratio)*40)
+            red_tint = int((1-ratio)*20)
+            col = (br+red_tint, br, br)
             pygame.draw.rect(s, col, (x0, y0, hw*2, hh*2), 3)
-            # Floor tiles inside the ring
             if ratio < 0.6:
-                pygame.draw.line(s, (br+8, br+6, br+4),
-                                 (x0, y0 + hh*2), (x0 + hw*2, y0 + hh*2), 1)
+                pygame.draw.line(s, (br+6, br+3, br+3),
+                                 (x0, y0+hh*2), (x0+hw*2, y0+hh*2), 1)
 
-        # Floor (dark trapezoid)
-        pygame.draw.polygon(s, (22, 18, 15), [
+        # ── Suelo oscuro (piedra mojada) ──────────────────────────────────────
+        pygame.draw.polygon(s, (14, 9, 8), [
             (0, HEIGHT), (WIDTH, HEIGHT),
-            (cx + int(WIDTH*0.52), cy + int(HEIGHT*0.42)),
-            (cx - int(WIDTH*0.52), cy + int(HEIGHT*0.42)),
+            (cx+int(WIDTH*0.52), cy+int(HEIGHT*0.42)),
+            (cx-int(WIDTH*0.52), cy+int(HEIGHT*0.42)),
         ])
-        # Floor grid lines
         for fi in range(6):
-            fy  = cy + int(HEIGHT * 0.42) + fi * (HEIGHT - cy - int(HEIGHT*0.42)) // 6
-            fw  = int(WIDTH * 0.52) + fi * (WIDTH//2 - int(WIDTH*0.52)) // 6
-            pygame.draw.line(s, (32, 28, 24),
-                             (cx - fw, fy), (cx + fw, fy), 1)
-        # Perspective lines on floor
-        for fv in range(-5, 6, 2):
-            ex = cx + fv * (WIDTH // 10)
-            pygame.draw.line(s, (28, 24, 20),
-                             (cx, cy + int(HEIGHT*0.42)),
-                             (ex, HEIGHT), 1)
+            fy = cy+int(HEIGHT*0.42) + fi*(HEIGHT-cy-int(HEIGHT*0.42))//6
+            fw = int(WIDTH*0.52) + fi*(WIDTH//2-int(WIDTH*0.52))//6
+            pygame.draw.line(s, (22,15,13),(cx-fw,fy),(cx+fw,fy),1)
+        for fv in range(-5,6,2):
+            pygame.draw.line(s,(18,12,10),(cx,cy+int(HEIGHT*0.42)),
+                             (cx+fv*(WIDTH//10),HEIGHT),1)
+        # Manchas oscuras en el suelo
+        random.seed(7777)
+        for _ in range(8):
+            sx2=random.randint(100,WIDTH-100); sy2=random.randint(min(cy+int(HEIGHT*0.42),HEIGHT-40),max(cy+int(HEIGHT*0.42)+1,HEIGHT-20))
+            pygame.draw.ellipse(s,(10,6,5),(sx2-20,sy2-6,40,12))
+        random.seed()
 
-        # Ceiling (dark trapezoid)
-        pygame.draw.polygon(s, (18, 14, 12), [
-            (0, 88), (WIDTH, 88),
-            (cx + int(WIDTH*0.52), cy - int(HEIGHT*0.42)),
-            (cx - int(WIDTH*0.52), cy - int(HEIGHT*0.42)),
+        # ── Techo oscuro ──────────────────────────────────────────────────────
+        pygame.draw.polygon(s,(10,7,6),[
+            (0,88),(WIDTH,88),
+            (cx+int(WIDTH*0.52),cy-int(HEIGHT*0.42)),
+            (cx-int(WIDTH*0.52),cy-int(HEIGHT*0.42)),
         ])
 
-        # Left and right walls
-        for side in (-1, 1):
-            wx  = cx + side * int(WIDTH * 0.52)
-            wpts = [(cx + side * WIDTH//2, 88), (wx, cy - int(HEIGHT*0.42)),
-                    (wx, cy + int(HEIGHT*0.42)), (cx + side * WIDTH//2, HEIGHT)]
-            pygame.draw.polygon(s, (28, 24, 20), wpts)
-            # Wall brick lines
-            for bi in range(6):
-                by = cy - int(HEIGHT*0.42) + bi * (int(HEIGHT*0.84)) // 6
-                bx_inner = wx
-                bx_outer = cx + side * WIDTH // 2
-                mix = bi / 6
-                bx  = int(bx_inner + (bx_outer - bx_inner) * mix)
-                pygame.draw.line(s, (38, 33, 28), (bx_inner, by), (bx, HEIGHT if by > cy else 88), 1)
+        # ── Paredes laterales con grietas ─────────────────────────────────────
+        for side in (-1,1):
+            wx  = cx + side*int(WIDTH*0.52)
+            wpts= [(cx+side*WIDTH//2,88),(wx,cy-int(HEIGHT*0.42)),
+                   (wx,cy+int(HEIGHT*0.42)),(cx+side*WIDTH//2,HEIGHT)]
+            pygame.draw.polygon(s,(18,12,10),wpts)
+            for bi in range(8):
+                by2 = cy-int(HEIGHT*0.42)+bi*(int(HEIGHT*0.84))//8
+                mix = bi/8
+                bx_ = int(wx + (cx+side*WIDTH//2-wx)*mix)
+                pygame.draw.line(s,(28,18,16),(wx,by2),(bx_,HEIGHT if by2>cy else 88),1)
+            # Cadenas/raíces en las paredes
+            for chain_y in range(cy-80, cy+80, 40):
+                csx = int(wx + (cx+side*WIDTH//2-wx)*0.3)
+                pygame.draw.line(s,(50,40,35),(csx,chain_y),(csx+side*8,chain_y+20),2)
+                pygame.draw.circle(s,(45,35,30),(csx+side*4,chain_y+10),3)
 
-        # Animated torches on side walls
-        for tx, ty in ((int(cx - WIDTH*0.38), cy - 20), (int(cx + WIDTH*0.38), cy - 20)):
-            self._draw_torch(s, tx, ty, t)
+        # ── Antorchas de sangre rojas ─────────────────────────────────────────
+        for tx,ty in ((int(cx-WIDTH*0.38),cy-20),(int(cx+WIDTH*0.38),cy-20)):
+            self._draw_scary_torch(s, tx, ty, t)
 
-        # Atmospheric fog / end glow (vanishing point)
-        fog = pygame.Surface((300, 180), pygame.SRCALPHA)
-        fa  = int(18 + math.sin(t*0.7)*8)
-        pygame.draw.ellipse(fog, (70, 110, 80, fa), fog.get_rect())
-        s.blit(fog, (cx - 150, cy - 90))
+        # ── Niebla verde espeluznante en el punto de fuga ─────────────────────
+        for i in range(4):
+            fw2 = 120 + i*50; fh2 = 70 + i*30
+            fog  = pygame.Surface((fw2,fh2), pygame.SRCALPHA)
+            fa   = int(10+math.sin(t*0.5+i)*5)
+            pygame.draw.ellipse(fog,(15,60+i*10,25,fa),fog.get_rect())
+            s.blit(fog,(cx-fw2//2,cy-fh2//2))
+
+        # ── Viñeta roja pulsante (terror) ─────────────────────────────────────
+        pulse  = (math.sin(t*1.4)+1)/2
+        red_a  = int(25+pulse*35)
+        vig    = pygame.Surface((WIDTH,HEIGHT),pygame.SRCALPHA)
+        for dist in range(120,0,-30):
+            a2 = int(red_a*(1-dist/120))
+            pygame.draw.rect(vig,(160,8,8,a2),(0,0,dist,HEIGHT))
+            pygame.draw.rect(vig,(160,8,8,a2),(WIDTH-dist,0,dist,HEIGHT))
+            pygame.draw.rect(vig,(160,8,8,a2),(0,0,WIDTH,dist))
+            pygame.draw.rect(vig,(160,8,8,a2),(0,HEIGHT-dist,WIDTH,dist))
+        s.blit(vig,(0,0))
+
+    def _draw_scary_torch(self, surf, x, y, t):
+        """Antorcha de sangre roja para el corredor aterrador."""
+        # Soporte oxidado
+        pygame.draw.rect(surf,(65,35,15),(x-3,y,6,14),border_radius=2)
+        # Cadena encima
+        for cy2 in range(y-8,y,4):
+            pygame.draw.circle(surf,(55,48,42),(x,cy2),2)
+        # Llama roja-morada
+        fw=10+int(math.sin(t*9.5)*3); fh=17+int(math.sin(t*8.2+1)*5)
+        pygame.draw.polygon(surf,(160,15,15),[(x,y-fh),(x-fw//2,y),(x+fw//2,y)])
+        pygame.draw.polygon(surf,(220,55,8), [(x,y-fh+5),(x-fw//3,y-3),(x+fw//3,y-3)])
+        pygame.draw.circle(surf,(255,220,150),(x,y-4),3)
+        # Halo rojo-violeta
+        gs=pygame.Surface((90,90),pygame.SRCALPHA)
+        ga=int(40+math.sin(t*6)*22)
+        pygame.draw.circle(gs,(160,15,70,ga),(45,45),45)
+        surf.blit(gs,(x-45,y-50))
+        # Gotas "sangre"
+        for di in range(3):
+            dx2=x+(di-1)*4; dy_s=y+12
+            dl=int(math.sin(t*2.5+di*1.5)*4)+7
+            if dl>3:
+                pygame.draw.line(surf,(130,8,8),(dx2,dy_s),(dx2,dy_s+dl),2)
+                pygame.draw.circle(surf,(150,12,12),(dx2,dy_s+dl),2)
 
     def _draw_event_panel(self, s, t, ev, msg, ev_col, cx):
         """Floating event card in the middle of the tunnel."""
@@ -966,6 +1316,11 @@ class Game:
 
         self.map_view.center_camera(self.player.x, self.player.y, self.tile_map)
         self.map_view.draw(self.tile_map, self.player, self._opened_objects)
+        # Floating damage numbers drawn above the map
+        self._draw_hurt_tiles()        # flash de color sobre tiles golpeados
+        self._draw_walk_particles()
+        self._draw_enemy_hp_bars()     # barras de HP sobre monstruos dañados
+        self._draw_hit_effects()
 
         if in_corridor:
             # Show progress bar and corridor-specific HUD
@@ -1171,71 +1526,203 @@ class Game:
     def _draw_char_select(self):
         from ui.map_view import draw_character
         s  = self.screen
-        cx, cy = WIDTH // 2, HEIGHT // 2
+        cx = WIDTH // 2
         t  = self._anim_t
-        s.fill((8, 8, 18))
-        # Animated bg dots
+        s.fill((7, 8, 16))
+
+        # Fondo animado
         random.seed(99)
-        for i in range(60):
+        for i in range(55):
             sx = random.randint(0, WIDTH); sy = random.randint(0, HEIGHT)
             br = int((math.sin(t*1.5+i)*0.5+0.5)*80)+30
             pygame.draw.circle(s,(br,br,br//2),(sx,sy),1)
         random.seed()
-        # Title
-        self._title_glow(s,"ELIGE TU PERSONAJE",self.fonts["title"],C["green"],cx,100,16)
-        hint=self.fonts["sm"].render("Flechas: cambiar   ENTER: confirmar   ESC: volver",True,C["text_dim"])
-        s.blit(hint,hint.get_rect(center=(cx,148)))
-        # Characters
-        card_w, card_h = 360, 420
-        spacing = 80
-        total   = len(CHARACTERS)*card_w + (len(CHARACTERS)-1)*spacing
-        x0 = cx - total//2
+
+        # ── Título limpio (sin glow exagerado) ────────────────────────────────
+        title_y = 68
+        tsh = self.fonts["title"].render("ELIGE TU PERSONAJE", True, (0, 20, 10))
+        tit = self.fonts["title"].render("ELIGE TU PERSONAJE", True, C["green"])
+        s.blit(tsh, tsh.get_rect(center=(cx+3, title_y+4)))
+        s.blit(tit, tit.get_rect(center=(cx, title_y)))
+
+        hint = self.fonts["sm"].render(
+            "Flechas: cambiar    ENTER: confirmar    ESC: volver", True, C["text_dim"])
+        s.blit(hint, hint.get_rect(center=(cx, title_y+54)))
+
+        # ── Tarjetas — anchas y bien contenidas ───────────────────────────────
+        card_w  = 490
+        card_h  = 430
+        gap     = 36
+        total   = 2 * card_w + gap
+        x0      = cx - total // 2
+        card_top= title_y + 82
+
         for i, char in enumerate(CHARACTERS):
-            cx2 = x0 + i*(card_w+spacing) + card_w//2
-            cy2 = cy + 30
+            cx2 = x0 + i*(card_w+gap) + card_w//2
             sel = (i == self._selected_char)
-            cr  = pygame.Rect(cx2-card_w//2, cy2-card_h//2, card_w, card_h)
-            bg  = pygame.Surface((card_w, card_h), pygame.SRCALPHA)
-            bg.fill((10,12,28,220))
-            s.blit(bg, cr.topleft)
+            cr  = pygame.Rect(x0 + i*(card_w+gap), card_top, card_w, card_h)
             col = char["shirt"] if sel else C["border_hi"]
-            pygame.draw.rect(s, col, cr, 3 if sel else 1, border_radius=12)
+
+            # Glow exterior si seleccionado
             if sel:
-                gs = pygame.Surface((card_w+20,card_h+20),pygame.SRCALPHA)
-                pygame.draw.rect(gs,(*col[:3],30),gs.get_rect(),border_radius=16)
-                s.blit(gs,(cr.x-10,cr.y-10))
-            # Character sprite (big)
-            spr_x, spr_y = cx2, cr.y+90
-            draw_character(s, spr_x, spr_y, t if sel else 0.0,
+                pulse = (math.sin(t*2.5)+1)/2
+                gs = pygame.Surface((card_w+24, card_h+24), pygame.SRCALPHA)
+                pygame.draw.rect(gs, (*col[:3], int(18+pulse*28)),
+                                 gs.get_rect(), border_radius=18)
+                s.blit(gs, (cr.x-12, cr.y-12))
+
+            # Fondo de la tarjeta
+            bg = pygame.Surface((card_w, card_h), pygame.SRCALPHA)
+            bg.fill((10, 12, 28, 235))
+            s.blit(bg, cr.topleft)
+            pygame.draw.rect(s, col, cr, 3 if sel else 1, border_radius=14)
+
+            # Franja superior del color del personaje
+            header = pygame.Rect(cr.x, cr.y, card_w, 10)
+            pygame.draw.rect(s, col, header, border_radius=14)
+
+            # Sprite del personaje (animado si seleccionado)
+            bob = int(math.sin(t*3.5)*4) if sel else 0
+            draw_character(s, cx2, cr.y + 88 + bob, t if sel else 0.0,
                            is_moving=sel, facing=(0,1),
-                           shirt_col=char["shirt"],hair_col=char["hair"],
+                           shirt_col=char["shirt"], hair_col=char["hair"],
                            pants_col=char.get("pants",(35,44,112)))
-            # Name
-            nt = self.fonts["lg"].render(char["name"],True,col)
-            s.blit(nt,nt.get_rect(center=(cx2, cr.y+130)))
-            # Desc
-            for di,dl in enumerate(char["desc"].split("\n")):
-                dt = self.fonts["sm"].render(dl,True,C["text_dim"])
-                s.blit(dt,dt.get_rect(center=(cx2, cr.y+160+di*22)))
-            # Stats bars
-            stats = [("HP",char["hp"],50,C["hp_bar"]),("ATK",char["attack"],20,C["orange"]),
-                     ("DEF",char["defense"],20,C["blue"])]
-            sy_ = cr.y + 220
-            for label,val,mx,sc in stats:
-                lt = self.fonts["xs"].render(f"{label} {val}",True,sc)
-                s.blit(lt,(cr.x+20, sy_))
-                bw = card_w-50
-                pygame.draw.rect(s,(30,30,42),(cr.x+80,sy_,bw,10),border_radius=4)
-                fw = int(bw*val/mx)
-                pygame.draw.rect(s,sc,(cr.x+80,sy_,fw,10),border_radius=4)
-                sy_ += 26
-            # Special
-            spt = self.fonts["sm"].render(char["special"],True,C["gold"])
-            s.blit(spt,spt.get_rect(center=(cx2,cr.y+330)))
-            # SELECCIONADO indicator
+
+            # Nombre
+            nt = self.fonts["lg"].render(char["name"], True, col)
+            s.blit(nt, nt.get_rect(center=(cx2, cr.y + 118)))
+
+            # Descripción
+            for di, dl in enumerate(char["desc"].split("\n")):
+                dt = self.fonts["sm"].render(dl, True, C["text_dim"])
+                s.blit(dt, dt.get_rect(center=(cx2, cr.y + 152 + di*22)))
+
+            # ── Stats bars (SIEMPRE dentro de la tarjeta) ─────────────────────
+            bar_lx  = cr.x + 18          # x donde empieza la etiqueta
+            bar_x   = cr.x + 92          # x donde empieza la barra
+            bar_max = card_w - 108        # ancho máximo de la barra (cr.right - bar_x - 16)
+            stats   = [
+                ("HP",  char["hp"],       50, (220, 55, 55)),
+                ("ATK", char["attack"],   20, (240, 148, 55)),
+                ("DEF", char["defense"],  20, (75, 138, 255)),
+            ]
+            sy_ = cr.y + 200
+            for label, val, mx, sc in stats:
+                # Etiqueta
+                lt = self.fonts["sm"].render(f"{label} {val}", True, sc)
+                s.blit(lt, (bar_lx, sy_ - lt.get_height()//2))
+                # Barra (capped at bar_max)
+                fw = min(bar_max, int(bar_max * val / mx))
+                pygame.draw.rect(s, (24, 24, 38), (bar_x, sy_-5, bar_max, 10), border_radius=4)
+                if fw:
+                    pygame.draw.rect(s, sc, (bar_x, sy_-5, fw, 10), border_radius=4)
+                    shine = tuple(min(255,c+55) for c in sc)
+                    pygame.draw.rect(s, shine, (bar_x+1, sy_-5, max(0,fw-2), 4), border_radius=3)
+                pygame.draw.rect(s, C["border_hi"], (bar_x, sy_-5, bar_max, 10), 1, border_radius=4)
+                sy_ += 32
+
+            # Habilidad especial
+            spt = self.fonts["sm"].render(char["special"], True, C["gold"])
+            s.blit(spt, spt.get_rect(center=(cx2, cr.y + 318)))
+
+            # Separador
+            pygame.draw.line(s, C["border"], (cr.x+20, cr.y+332), (cr.right-20, cr.y+332), 1)
+
+            # SELECCIONADO o instrucción
             if sel:
-                st2 = self.fonts["md"].render("[ SELECCIONADO ]",True,col)
-                s.blit(st2,st2.get_rect(center=(cx2,cr.bottom-30)))
+                si = self.fonts["md"].render("[ SELECCIONADO ]", True, col)
+                s.blit(si, si.get_rect(center=(cx2, cr.bottom - 34)))
+            else:
+                si2 = self.fonts["sm"].render("Flecha para elegir", True, C["text_dim"])
+                s.blit(si2, si2.get_rect(center=(cx2, cr.bottom - 34)))
+
+        # ── Animación de selección encima ─────────────────────────────────────
+        if getattr(self, '_char_select_anim', None):
+            self._draw_char_select_anim(s, cx, t)
+
+    def _draw_char_select_anim(self, s, cx, t):
+        """Animación espectacular al confirmar el personaje."""
+        from ui.map_view import draw_character
+        anim  = self._char_select_anim
+        ratio = 1.0 - anim["timer"] / anim["max"]   # 0→1
+        char  = self._chosen_char
+        cy    = HEIGHT // 2
+
+        # ── Overlay oscuro que aparece progresivamente ────────────────────────
+        ov = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        ov.fill((5, 5, 15, int(min(1.0, ratio*2)*200)))
+        s.blit(ov, (0, 0))
+
+        # ── Flash blanco al inicio ────────────────────────────────────────────
+        if ratio < 0.14:
+            fa = int((1 - ratio/0.14)*240)
+            fl = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            fl.fill((255, 255, 255, fa))
+            s.blit(fl, (0, 0))
+
+        # ── Personaje grande en el centro, saltando ───────────────────────────
+        if ratio > 0.04:
+            bob = int(math.sin(ratio * math.pi * 5.5) * 42) if ratio < 0.72 else 0
+            # Sombra elíptica debajo
+            shad = pygame.Surface((60, 18), pygame.SRCALPHA)
+            pygame.draw.ellipse(shad, (0,0,0,80), shad.get_rect())
+            s.blit(shad, (cx-30, cy+22))
+            draw_character(s, cx, cy - 30 - bob, t*9, is_moving=True, facing=(0,1),
+                           shirt_col=char["shirt"], hair_col=char["hair"],
+                           pants_col=char.get("pants"))
+
+        # ── Estrellas / confetti que vuelan ───────────────────────────────────
+        if ratio > 0.06:
+            for i in range(28):
+                angle = (i/28)*math.pi*2 + ratio*4
+                dist  = ratio * 280
+                sx2   = cx + int(math.cos(angle)*dist)
+                sy2   = cy - 30 + int(math.sin(angle)*dist)
+                sa    = max(0, int((1-ratio**0.6)*255))
+                sz    = max(1, int((1-ratio)*5)+1)
+                col   = [(255,218,50),(255,120,70),(100,215,255),(160,255,130)][i%4]
+                star  = pygame.Surface((sz*2+2, sz*2+2), pygame.SRCALPHA)
+                pygame.draw.circle(star, (*col, sa), (sz+1,sz+1), sz)
+                s.blit(star, (sx2-sz-1, sy2-sz-1))
+
+        # ── Confetti en cascada ───────────────────────────────────────────────
+        if ratio > 0.18:
+            random.seed(int(ratio*28))
+            for i in range(45):
+                cfx = random.randint(10, WIDTH-10)
+                cfy = int((ratio-0.18)*HEIGHT*1.6) - random.randint(0, HEIGHT)
+                cfy = cfy % HEIGHT
+                cfc = random.choice([(255,218,50),(255,90,90),(90,200,255),(160,255,160),(255,160,220)])
+                ca  = max(0, int((1.0 - ratio*0.75)*255))
+                if ca > 20:
+                    cs = pygame.Surface((8, 12), pygame.SRCALPHA)
+                    cs.fill((*cfc, ca))
+                    s.blit(cs, (cfx, cfy))
+            random.seed()
+
+        # ── Texto "¡ELEGIDO!" ─────────────────────────────────────────────────
+        if ratio > 0.14:
+            ta = int(min(1.0, (ratio-0.14)/0.18)*255)
+            shad = self.fonts["title"].render("¡ELEGIDO!", True, (0,0,0))
+            main = self.fonts["title"].render("¡ELEGIDO!", True, char["shirt"])
+            shad.set_alpha(ta//2); main.set_alpha(ta)
+            s.blit(shad, shad.get_rect(center=(cx+3, cy+82)))
+            s.blit(main, main.get_rect(center=(cx, cy+80)))
+
+        # ── Nombre del personaje ──────────────────────────────────────────────
+        if ratio > 0.25:
+            na = int(min(1.0, (ratio-0.25)/0.18)*255)
+            nt = self.fonts["lg"].render(char["name"], True, C["gold"])
+            nt.set_alpha(na)
+            s.blit(nt, nt.get_rect(center=(cx, cy+126)))
+
+        # ── Círculo de halo que se expande ───────────────────────────────────
+        if 0.04 < ratio < 0.5:
+            hr = int(ratio * 320)
+            ha = int((0.5 - ratio) * 2 * 120)
+            hsurf = pygame.Surface((hr*2+4, hr*2+4), pygame.SRCALPHA)
+            pygame.draw.circle(hsurf, (*char["shirt"][:3], ha), (hr+2,hr+2), hr, 3)
+            s.blit(hsurf, (cx-hr-2, cy-30-hr-2))
 
     # ── Data Structures panel ─────────────────────────────────────────────────
 
@@ -1285,15 +1772,108 @@ class Game:
 
     # ── K key: attack adjacent monster ───────────────────────────────────────
 
-    def _attack_adjacent_monster(self):
+    def _quick_attack(self):
+        """K key — golpe directo al monstruo más cercano, sin abrir menú."""
         c, r = self.player.x, self.player.y
         for dc, dr in ((0,0),(1,0),(-1,0),(0,1),(0,-1)):
             nc, nr = c+dc, r+dr
-            obj = self.tile_map.get_object(nc, nr)
-            if obj == "enemy" and (nc, nr) not in self._opened_objects:
-                self._start_node_combat(nc, nr)
+            if (self.tile_map.get_object(nc, nr) == 'enemy' and
+                    (nc, nr) not in self._opened_objects):
+                self._do_quick_hit(nc, nr)
                 return
-        self._notify("No hay monstruos cerca. (K para atacar)", C["text_dim"], 1.2)
+        self._notify("No hay monstruo cerca  [ K = golpear ]", C["text_dim"], 1.0)
+
+    def _do_quick_hit(self, ec: int, er: int):
+        """Un intercambio de golpes rápido — sin menú, con animación."""
+        ntype = getattr(self.tile_map, 'node_type',
+                        self.graph.nodes[self.current_node_id].type)
+        key = (ec, er)
+        if key not in self._map_enemies:
+            self._map_enemies[key] = make_enemy(ntype, 1.0 + self.player.level * 0.08)
+
+        enemy = self._map_enemies[key]
+
+        # Calcular posición en pantalla del monstruo
+        vp     = self.map_view.viewport
+        ex_px  = vp.x + (ec - self.map_view.cam_c) * TILE_SIZE + TILE_SIZE // 2
+        ey_px  = vp.y + (er - self.map_view.cam_r) * TILE_SIZE
+        px_px  = vp.x + (self.player.x - self.map_view.cam_c) * TILE_SIZE + TILE_SIZE // 2
+        py_px  = vp.y + (self.player.y - self.map_view.cam_r) * TILE_SIZE
+
+        # ── Jugador golpea al monstruo ────────────────────────────────────────
+        pdmg   = self.player.deal_damage()
+        actual = enemy.take_damage(pdmg)
+        self._hit_effects.append({"x": ex_px, "y": ey_px, "dmg": actual,
+                                   "col": C["orange"], "t": 1.3, "max": 1.3})
+        self.combat_ui._shake = 0.06
+        self._play_sfx('hit_enemy')
+        # Flash naranja en el tile del monstruo golpeado
+        self._hurt_tiles.append([ec, er, 0.22, (255, 140, 30)])
+
+        if not enemy.is_alive():
+            coins   = enemy.loot()
+            leveled = self.player.gain_exp(enemy.exp)
+            self.player.coins += coins
+            self.tile_map.remove_object(ec, er)
+            self._opened_objects.add((ec, er))
+            del self._map_enemies[key]
+            # Burst death effect
+            self._hit_effects.append({"x": ex_px, "y": ey_px + 16, "dmg": 0,
+                                       "col": C["red"], "t": 0.7, "max": 0.7,
+                                       "burst": True})
+            self._notify(f"Venciste al {enemy.name}! +{coins}$ +{enemy.exp}EXP", C["gold"], 2.5)
+            if leveled:
+                self._notify(f"NIVEL {self.player.level}!", C["green"], 2.5)
+                self._play_sfx('levelup')
+            return
+
+        # Show remaining HP
+        hp_pct = int(enemy.hp_ratio * 100)
+        self._notify(f"{enemy.name}:  {enemy.hp}/{enemy.max_hp} HP ({hp_pct}%)",
+                     C["text_dim"], 0.9)
+
+        # ── Monstruo contraataca ───────────────────────────────────────────────
+        edgm    = enemy.deal_damage()
+        actual_e= self.player.take_damage(edgm)
+        self._play_sfx('hit_player')
+        self._hit_effects.append({"x": px_px, "y": py_px, "dmg": actual_e,
+                                   "col": C["red"], "t": 1.3, "max": 1.3})
+        if not self.player.is_alive():
+            self._notify("Has caido...", C["red"], 2.0)
+            self.state = STATE_GAME_OVER
+
+    def _draw_hit_effects(self):
+        """Dibuja números de daño flotantes y bursts de muerte."""
+        s = self.screen
+        for ef in self._hit_effects:
+            ratio = ef["t"] / ef["max"]
+            alpha = int(min(1.0, ratio * 3) * 255)
+
+            if ef.get("burst"):
+                # Círculo expandiéndose (muerte)
+                r_ = int((1 - ratio) * 32)
+                if r_ > 2:
+                    bs = pygame.Surface((r_*2+4, r_*2+4), pygame.SRCALPHA)
+                    pygame.draw.circle(bs, (*ef["col"][:3], alpha//3), (r_+2, r_+2), r_)
+                    pygame.draw.circle(bs, (*ef["col"][:3], alpha//2), (r_+2, r_+2), r_, 2)
+                    s.blit(bs, (ef["x"]-r_-2, ef["y"]-r_-2))
+                # Stars / sparks
+                for i in range(6):
+                    angle = i * math.pi / 3 + (1-ratio)*math.pi
+                    dist  = r_ + 4
+                    sx_   = int(ef["x"] + math.cos(angle)*dist)
+                    sy_   = int(ef["y"] + math.sin(angle)*dist)
+                    pygame.draw.circle(s, ef["col"], (sx_, sy_), 2)
+            else:
+                # Número de daño que sube flotando
+                fly = int((1 - ratio) * 44)
+                txt = self.fonts["lg"].render(f"-{ef['dmg']}", True, ef["col"])
+                # Sombra
+                sh  = self.fonts["lg"].render(f"-{ef['dmg']}", True, (0,0,0))
+                sh.set_alpha(alpha // 2)
+                s.blit(sh,  (ef["x"] - txt.get_width()//2 + 2, ef["y"] - 24 - fly + 2))
+                txt.set_alpha(alpha)
+                s.blit(txt, (ef["x"] - txt.get_width()//2,     ef["y"] - 24 - fly))
 
     # ── game logic helpers ────────────────────────────────────────────────────
 
@@ -1395,7 +1975,8 @@ class Game:
         elif obj == "chest" and (c, r) not in self._opened_objects:
             self._open_chest(c, r)
         elif obj == "enemy" and (c, r) not in self._opened_objects:
-            self._start_node_combat(c, r)
+            # Combate directo en el mapa — sin abrir pantalla separada
+            self._do_quick_hit(c, r)
 
     def _start_node_combat(self, c: int, r: int):
         self._opened_objects.add((c, r))
@@ -1431,6 +2012,8 @@ class Game:
 
         self._corridor_dest    = target
         self._enemy_move_timer = 0.0
+        self._map_enemies      = {}
+        self._hit_effects      = []
         self.tile_map          = corridor
         px, py                 = corridor.player_start
         self.player.x, self.player.y = px, py
@@ -1475,6 +2058,7 @@ class Game:
             if ao == "chest" and (c+dc, r+dr) not in self._opened_objects:
                 self._open_chest(c+dc, r+dr); return
             if ao == "shop" and not in_corridor:
+                self._play_sfx('shop_bell')
                 self.state = STATE_SHOP; return
 
     def _try_open_shop(self):
@@ -1482,6 +2066,7 @@ class Game:
         c, r = self.player.x, self.player.y
         for dc, dr in ((0, 0), (0, 1), (0, -1), (1, 0), (-1, 0)):
             if self.tile_map.get_object(c+dc, r+dr) == "shop":
+                self._play_sfx('shop_bell')
                 self.state = STATE_SHOP
                 return
         self._notify("No hay tienda cerca.", C["text_dim"], 1.5)
@@ -1495,7 +2080,7 @@ class Game:
             self.player.add_item(item)
         self._opened_objects.add((c, r))
         self.tile_map.remove_object(c, r)
-        # Small floating notifications — no big popup
+        self._play_sfx('chest')
         self._notify(f"+{coins} monedas", C["gold"], 2.2)
         if item:
             self._notify(f"Encontraste: {item}", C["cyan"], 3.0)
