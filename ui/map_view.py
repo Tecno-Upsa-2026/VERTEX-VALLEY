@@ -10,6 +10,7 @@ from config import (
     TILE_GRASS, TILE_WALL, TILE_WATER, TILE_TREE,
     TILE_ROCK, TILE_FLOOR, TILE_SAND,
 )
+from entities import werewolf_sprite as _wws
 
 T = TILE_SIZE  # 32 px
 
@@ -226,6 +227,76 @@ def draw_goblin(s, cx, cy, t):
     for tx in (cx-2, cx, cx+2):
         pygame.draw.polygon(s, (240,238,220), [(tx,y-7),(tx+1,y-4),(tx+2,y-7)])
 
+def draw_werewolf(s, cx, cy, t):
+    """Hombre Lobo boss — usa sprite sheet si está disponible, si no dibuja proceduralmente."""
+    surf = _wws.frame_for_t("rest", t, 80, 80)
+    if surf is not None:
+        # Aura roja pulsante de boss
+        aura = pygame.Surface((100, 100), pygame.SRCALPHA)
+        ga = 18 + int(12 * math.sin(t * 2))
+        pygame.draw.ellipse(aura, (200, 40, 40, ga), aura.get_rect())
+        s.blit(aura, (cx - 50, cy - 76))
+        s.blit(surf, (cx - 40, cy - 72))
+        return
+
+    # ── Fallback procedural grande y amenazante ────────────────────────────────
+    bob = int(math.sin(t * 2.5) * 3)
+    y   = cy + bob - 4   # desplazado arriba para ser más alto que un tile
+
+    # Aura roja pulsante de boss
+    pulse = (math.sin(t * 3) + 1) / 2
+    aura  = pygame.Surface((64, 64), pygame.SRCALPHA)
+    pygame.draw.ellipse(aura, (180, 20, 20, int(30 + pulse * 25)), aura.get_rect())
+    s.blit(aura, (cx - 32, y - 16))
+
+    # Sombra
+    _shadow(s, cx, cy + 14, 44, 11)
+
+    # Cuerpo grande (pecho musculoso)
+    pygame.draw.ellipse(s, (52, 38, 30), (cx - 18, y - 6,  38, 22))  # sombra cuerpo
+    pygame.draw.ellipse(s, (88, 65, 48), (cx - 17, y - 8,  36, 22))  # cuerpo
+
+    # Brazos con garras
+    pygame.draw.ellipse(s, (78, 58, 42), (cx - 28, y - 4, 12, 20))   # brazo izq
+    pygame.draw.ellipse(s, (78, 58, 42), (cx + 17, y - 4, 12, 20))   # brazo der
+    # Garras izquierda
+    for i, gx in enumerate((cx - 28, cx - 24, cx - 20)):
+        pygame.draw.line(s, (210, 200, 185), (gx, y + 16), (gx - 2 + i, y + 22), 2)
+    # Garras derecha
+    for i, gx in enumerate((cx + 19, cx + 23, cx + 27)):
+        pygame.draw.line(s, (210, 200, 185), (gx, y + 16), (gx + 2 - i, y + 22), 2)
+
+    # Cabeza grande
+    pygame.draw.circle(s, (62, 45, 35), (cx + 1, y - 20), 14)  # sombra cabeza
+    pygame.draw.circle(s, (100, 75, 55), (cx,     y - 21), 14)
+
+    # Orejas puntiagudas
+    pygame.draw.polygon(s, (110, 82, 60), [(cx-12, y-33), (cx-18, y-20), (cx-5,  y-20)])
+    pygame.draw.polygon(s, (110, 82, 60), [(cx+12, y-33), (cx+18, y-20), (cx+5,  y-20)])
+    pygame.draw.polygon(s, (175, 80, 80), [(cx-11, y-31), (cx-15, y-23), (cx-6,  y-23)])
+    pygame.draw.polygon(s, (175, 80, 80), [(cx+11, y-31), (cx+15, y-23), (cx+6,  y-23)])
+
+    # Hocico
+    pygame.draw.ellipse(s, (80, 58, 45), (cx - 6, y - 13, 12, 8))
+    pygame.draw.circle(s, (30, 20, 20),  (cx - 2, y - 12), 2)
+    pygame.draw.circle(s, (30, 20, 20),  (cx + 2, y - 12), 2)
+
+    # Ojos con brillo ámbar pulsante
+    rg = _clamp(int((math.sin(t * 5) + 1) * 30) + 200)
+    for ex in (-5, 5):
+        gs = pygame.Surface((14, 14), pygame.SRCALPHA)
+        pygame.draw.circle(gs, (rg, int(rg * 0.55), 10, 140), (7, 7), 7)
+        s.blit(gs, (cx + ex - 7, y - 29))
+        pygame.draw.circle(s, (rg, int(rg * 0.55), 10), (cx + ex, y - 24), 4)
+        pygame.draw.circle(s, (15, 5, 5), (cx + ex + 1, y - 24), 2)
+
+    # Patas
+    for lx in (cx - 13, cx - 5, cx + 3, cx + 10):
+        _r(s, (65, 48, 36), lx, y + 13, 7, 10)
+    # Cola
+    pygame.draw.arc(s, (88, 65, 48), (cx + 14, y - 10, 18, 20), math.pi / 4, math.pi, 5)
+
+
 _MONSTER_DRAW = {
     "forest":   draw_wolf,
     "cave":     draw_slime,
@@ -355,7 +426,8 @@ class MapView:
 
     def _grass(self, s, sx, sy, col, row, base):
         pygame.draw.rect(s, base, (sx, sy, T, T))
-        pygame.draw.rect(s, (_clamp(base[0]-8),)*3, (sx,sy,T,T), 1)
+        border = (_clamp(base[0]-10), _clamp(base[1]-10), _clamp(base[2]-8))
+        pygame.draw.rect(s, border, (sx, sy, T, T), 1)
         rng = _tile_rng(col, row)
         vtype = rng.randint(0,9)
         for _ in range(rng.randint(3,7)):
@@ -451,6 +523,12 @@ class MapView:
         elif obj == "enemy":
             # Dibujar monstruo real según bioma
             draw_monster(s, cx_, cy_-4, node_type, t)
+        elif obj == "werewolf":
+            draw_werewolf(s, cx_, cy_-4, t)
+            pulse = (math.sin(t * 3.5) + 1) / 2
+            lc = (_clamp(200 + int(pulse * 55)), 40, 40)
+            wt = self.F["xs"].render("! JEFE !", True, lc)
+            s.blit(wt, wt.get_rect(center=(cx_, sy - 66)))
         elif obj == "npc":       draw_npc(s, cx_, cy_+2, t=t)
         elif obj == "npc_elder": draw_npc(s, cx_, cy_+2, color=(200,150,80), t=t)
         elif obj == "npc_guard": draw_npc(s, cx_, cy_+2, color=(80,120,200), t=t)

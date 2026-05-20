@@ -27,7 +27,7 @@ import pygame
 from config import (
     WIDTH, HEIGHT, FPS, TITLE, C,
     STATE_TITLE, STATE_CHAR_SELECT, STATE_WORLD, STATE_DIJKSTRA, STATE_TRAVEL,
-    STATE_EXPLORE, STATE_COMBAT, STATE_SHOP, STATE_CHEST,
+    STATE_EXPLORE, STATE_COMBAT, STATE_SHOP, STATE_CHEST, STATE_EVENT,
     STATE_GAME_OVER, STATE_WIN,
     TILE_SIZE, NODE_DISPLAY_NAMES, NODE_COLORS, ITEMS, CHARACTERS,
 )
@@ -35,13 +35,15 @@ from core.graph            import WorldGraph
 from core.node_map         import TileMap
 from core.travel_corridor  import TravelCorridor
 from entities.player import Player
-from entities.enemy  import make_enemy
+from entities.enemy  import make_enemy, make_werewolf
 from systems.combat  import CombatSystem, CombatResult
 from ui.graph_view   import GraphView
 from ui.map_view     import MapView
 from ui.hud          import HUD, NodeInfoBar, BottomBar
 from ui.combat_ui    import CombatUI
 from ui.shop_ui      import ShopUI
+from ui.minimap      import Minimap
+from ui.weather      import WeatherSystem
 
 
 # ── Font loader ───────────────────────────────────────────────────────────────
@@ -132,6 +134,7 @@ class Game:
         self._selected_char = 0
         self._chosen_char   = CHARACTERS[0]
         self._ds_panel_open = False
+        self._logo_surf     = self._load_logo()
 
         # ── Audio ──────────────────────────────────────────────────────────────
         import sounds as _snd
@@ -159,15 +162,8 @@ class Game:
         self.graph  = WorldGraph(seed)
         self.player = Player(0, 0, character=self._chosen_char)
 
-        self.current_node_id = 0
-        self._load_node(0)
-
-        self.state      = STATE_TITLE
-        self.state_data: dict = {}
-
-        # UI objects (recreated once per game)
+        # UI objects must exist before _load_node (which calls weather.setup)
         self.graph_view  = GraphView(self.screen, self.fonts)
-        # Map uses the FULL screen — HUD is drawn as overlay on top
         self.map_view    = MapView(
             self.screen, self.fonts,
             pygame.Rect(0, 0, WIDTH, HEIGHT)
@@ -176,9 +172,21 @@ class Game:
         self.bottom_bar  = BottomBar(self.screen, self.fonts, WIDTH, HEIGHT)
         self.combat_ui   = CombatUI(self.screen, self.fonts)
         self.shop_ui     = ShopUI(self.screen, self.fonts)
+        self.minimap     = Minimap(self.screen, self.fonts)
+        self.weather     = WeatherSystem(WIDTH, HEIGHT)
 
-        self._selected_node : int | None = None
+        self.current_node_id = 0
+        self._load_node(0)
+
+        self.state      = STATE_TITLE
+        self.state_data: dict = {}
+
+        self._selected_node  : int | None  = None
+        self._show_minimap   : bool        = False
+        self._pending_event  : dict | None = None
         self._opened_objects: set  = set()
+        self._traveled_edges: set  = set()   # (min,max) pairs of traveled graph edges
+        self._corridor_path:  list = []       # full path of current corridor
         self._combat: CombatSystem | None = None
         self._anim_t = 0.0
 
@@ -208,14 +216,18 @@ class Game:
 
     def _load_node(self, node_id: int):
         node = self.graph.nodes[node_id]
+        is_first = not node.visited
         node.visited = True
         self.tile_map = TileMap(self.seed, node_id, node.type)
         px, py = self.tile_map.player_start
         self.player.x, self.player.y = px, py
         self._opened_objects = set()
-        self._map_enemies    = {}    # clear enemy HP tracking on new map
+        self._map_enemies    = {}
         self._hit_effects    = []
         self.current_node_id = node_id
+        self.weather.setup(node_id, self.seed, node.type)
+        if is_first:
+            self._pending_event = self._roll_node_event(node_id, node.type)
 
     # ── main loop ─────────────────────────────────────────────────────────────
 
@@ -255,22 +267,40 @@ class Game:
             STATE_EXPLORE:     self._ev_explore,
             STATE_COMBAT:      self._ev_combat,
             STATE_SHOP:        self._ev_shop,
+            STATE_EVENT:       self._ev_event,
             STATE_GAME_OVER:   self._ev_game_over,
             STATE_WIN:         self._ev_game_over,
         }
         dispatch.get(self.state, lambda e: None)(event)
 
     def _ev_title(self, e: pygame.event.Event):
+        # Controls overlay open — ESC or click closes it
+        if self.state_data.get("show_controls"):
+            if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+                self.state_data["show_controls"] = False
+            elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                self.state_data["show_controls"] = False
+            return
+
         if e.type == pygame.KEYDOWN:
             if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                # Go to character selection first
                 self.state = STATE_CHAR_SELECT
             elif e.key == pygame.K_BACKSPACE:
                 si = self.state_data.get("seed_input", "")
                 self.state_data["seed_input"] = si[:-1]
-            elif e.unicode.isdigit() and len(self.state_data.get("seed_input","")) < 8:
+            elif e.unicode.isdigit() and len(self.state_data.get("seed_input", "")) < 8:
                 self.state_data.setdefault("seed_input", "")
                 self.state_data["seed_input"] += e.unicode
+
+        elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+            btns = getattr(self, "_title_btns", {})
+            if btns.get("start", pygame.Rect(0, 0, 0, 0)).collidepoint(e.pos):
+                self.state = STATE_CHAR_SELECT
+            elif btns.get("controls", pygame.Rect(0, 0, 0, 0)).collidepoint(e.pos):
+                self.state_data["show_controls"] = True
+            elif btns.get("quit", pygame.Rect(0, 0, 0, 0)).collidepoint(e.pos):
+                pygame.quit()
+                sys.exit()
 
     def _ev_char_select(self, e: pygame.event.Event):
         if e.type != pygame.KEYDOWN:
@@ -336,7 +366,10 @@ class Game:
             self._try_open_shop()
         if key == pygame.K_h:
             self._ds_panel_open = not self._ds_panel_open
+        if key == pygame.K_TAB:
+            self._show_minimap = not self._show_minimap
         if key in (pygame.K_ESCAPE, pygame.K_m):
+            self._show_minimap = False
             if getattr(self.tile_map, 'is_corridor', False):
                 self._notify("Completa el corredor para acceder al mapa mundo", C["text_dim"], 1.8)
             else:
@@ -389,6 +422,8 @@ class Game:
         self.combat_ui.update(dt)
         self.shop_ui.update(dt)
         self.hud.update(dt)
+        self.minimap.update(dt)
+        self.weather.update(dt)
 
         # Tick floating notifications
         for n in self._notifs:
@@ -445,10 +480,10 @@ class Game:
         self._enemy_move_timer = 0.0
 
         px, py  = self.player.x, self.player.y
-        enemies = [(c, r) for (c, r), obj in list(self.tile_map.objects.items())
-                   if obj == 'enemy']
+        enemies = [(c, r, obj) for (c, r), obj in list(self.tile_map.objects.items())
+                   if obj in ('enemy', 'werewolf')]
 
-        for ec, er in enemies:
+        for ec, er, etype in enemies:
             dist = abs(ec - px) + abs(er - py)
             if dist > 12:
                 continue   # fuera del rango de aggro
@@ -462,15 +497,15 @@ class Game:
                 nc, nr = ec + tdc, er + tdr
                 if not self.tile_map.is_walkable(nc, nr):
                     continue
-                if self.tile_map.get_object(nc, nr) == 'enemy':
+                if self.tile_map.get_object(nc, nr) in ('enemy', 'werewolf'):
                     continue
                 self.tile_map.objects.pop((ec, er))
                 if nc == px and nr == py:
-                    # Alcanzó al jugador — ataque automático directo en el mapa
-                    self.tile_map.objects[(nc, nr)] = 'enemy'
+                    # Alcanzó al jugador — preservar tipo al mover
+                    self.tile_map.objects[(nc, nr)] = etype
                     self._enemy_auto_attack(nc, nr)
                     return
-                self.tile_map.objects[(nc, nr)] = 'enemy'
+                self.tile_map.objects[(nc, nr)] = etype
                 break
 
     # mantenemos alias para no romper referencias antiguas
@@ -478,6 +513,10 @@ class Game:
 
     def _enemy_auto_attack(self, ec: int, er: int):
         """El monstruo alcanza al jugador y lo golpea directamente."""
+        if self.tile_map.get_object(ec, er) == 'werewolf':
+            self._start_werewolf_combat(ec, er)
+            return
+
         ntype = getattr(self.tile_map, 'node_type',
                         self.graph.nodes[self.current_node_id].type)
         key = (ec, er)
@@ -718,6 +757,7 @@ class Game:
             STATE_EXPLORE:     self._draw_explore,
             STATE_COMBAT:      self._draw_combat,
             STATE_SHOP:        self._draw_explore,
+            STATE_EVENT:       self._draw_event,
             STATE_GAME_OVER:   self._draw_game_over,
             STATE_WIN:         self._draw_win,
         }
@@ -736,6 +776,37 @@ class Game:
     # ── title screen ──────────────────────────────────────────────────────────
 
     # ── Title-screen helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _load_logo() -> "pygame.Surface | None":
+        import os, shutil
+        assets = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+        # Auto-fix Windows double-extension bug (logo.png.png → logo.png)
+        for f in os.listdir(assets):
+            for bad in (".png.png", ".png.jpeg", ".png.jpg"):
+                if f.endswith(bad):
+                    fixed = f[: -len(bad)] + bad[:4]   # keep first ".png"
+                    try:
+                        shutil.move(os.path.join(assets, f),
+                                    os.path.join(assets, fixed))
+                    except Exception:
+                        pass
+        for name in ("logo.png", "logo.jpg", "logo.jpeg"):
+            path = os.path.join(assets, name)
+            if not os.path.exists(path):
+                continue
+            try:
+                raw = pygame.image.load(path).convert_alpha()
+                target_w = 540
+                target_h = int(raw.get_height() * target_w / raw.get_width())
+                MAX_H = 240
+                if target_h > MAX_H:
+                    target_h = MAX_H
+                    target_w = int(raw.get_width() * MAX_H / raw.get_height())
+                return pygame.transform.smoothscale(raw, (target_w, target_h))
+            except Exception:
+                continue
+        return None
 
     def _title_glow(self, s, text, font, col, cx, cy, glow_r=7):
         """
@@ -868,172 +939,218 @@ class Game:
         t  = self._anim_t
         cx = WIDTH // 2
 
-        # ── Background ────────────────────────────────────────────────────────
-        s.fill((7, 8, 16))
-        # Subtle radial glow at centre
-        for rad, alpha in ((500, 10), (350, 10), (200, 8)):
-            gs = pygame.Surface((rad*2, rad*2), pygame.SRCALPHA)
-            pygame.draw.circle(gs, (25, 45, 70, alpha), (rad, rad), rad)
-            s.blit(gs, (cx - rad, HEIGHT//2 - rad))
+        # ── Dark night sky ────────────────────────────────────────────────────
+        s.fill((4, 6, 14))
+        # Subtle horizon glow (green tint near tree line)
+        horiz = pygame.Surface((WIDTH, 240), pygame.SRCALPHA)
+        for i in range(16):
+            frac = i / 16
+            pygame.draw.rect(horiz, (8, 20, 8, int(frac * 30)),
+                             (0, 240 - int(frac * 240), WIDTH, int(frac * 240) + 1))
+        s.blit(horiz, (0, HEIGHT - 240))
 
-        # Animated graph in background
-        self._title_bg_graph(s, t)
+        # ── Stars ─────────────────────────────────────────────────────────────
+        rng_s = random.Random(42)
+        for _ in range(160):
+            sx_ = rng_s.randint(0, WIDTH)
+            sy_ = rng_s.randint(0, int(HEIGHT * 0.62))
+            br  = rng_s.randint(90, 210)
+            spd = rng_s.uniform(0.4, 2.2)
+            ph  = rng_s.random() * 6.28318
+            rad = rng_s.choice((1, 1, 1, 2))
+            tw  = int((math.sin(t * spd + ph) + 1) * 38)
+            col_s = (min(255, br + tw),) * 3
+            pygame.draw.circle(s, col_s, (sx_, sy_), rad)
 
-        # ── Title "VERTEX VALLEY" ─────────────────────────────────────────────
-        title_y = 108
-        # Panel oscuro detrás del título para contraste contra los nodos animados
-        title_surf = self.fonts["title"].render("VERTEX VALLEY", True, C["green"])
-        tw, th = title_surf.get_size()
-        panel = pygame.Surface((tw + 40, th + 20), pygame.SRCALPHA)
-        panel.fill((0, 0, 0, 140))
-        s.blit(panel, panel.get_rect(center=(cx, title_y)))
-        # Texto con contorno negro nítido
-        self._title_glow(s, "VERTEX VALLEY", self.fonts["title"], C["green"], cx, title_y, glow_r=7)
+        # ── Moon ──────────────────────────────────────────────────────────────
+        mx_, my_ = int(WIDTH * 0.82), int(HEIGHT * 0.15)
+        for r_g, a_g in ((88, 5), (64, 11), (44, 20), (32, 36)):
+            gm = pygame.Surface((r_g * 2, r_g * 2), pygame.SRCALPHA)
+            pygame.draw.circle(gm, (240, 238, 200, a_g), (r_g, r_g), r_g)
+            s.blit(gm, (mx_ - r_g, my_ - r_g))
+        pygame.draw.circle(s, (228, 225, 195), (mx_, my_), 38)
+        pygame.draw.circle(s, (244, 241, 218), (mx_, my_), 34)
+        for mcx, mcy, mcr in ((mx_ - 10, my_ + 7, 6), (mx_ + 13, my_ - 6, 4), (mx_ - 2, my_ - 13, 3)):
+            pygame.draw.circle(s, (210, 207, 178), (mcx, mcy), mcr)
 
-        # ── TecnoUpsa badge con corona #1 ─────────────────────────────────────
-        title_surf_w = self.fonts["title"].render("VERTEX VALLEY", True, C["green"]).get_width()
-        badge_cx = cx + title_surf_w // 2 + 72
-        badge_cy = title_y - 2
-        if badge_cx + 70 > WIDTH:   # si no cabe a la derecha, va en esquina
-            badge_cx = WIDTH - 78
-            badge_cy = 55
-        self._draw_tecnoupsa_badge(s, badge_cx, badge_cy)
+        # ── Tree silhouettes at bottom ─────────────────────────────────────────
+        t_rng = random.Random(77)
+        TREE_COL = (5, 12, 5)
+        for _ in range(24):
+            tx_  = t_rng.randint(-12, WIDTH + 12)
+            th_  = t_rng.randint(110, 230)
+            tw_  = t_rng.randint(34, 78)
+            n_l  = t_rng.randint(3, 5)
+            for lyr in range(n_l):
+                lf     = lyr / max(1, n_l - 1)
+                tip_y  = HEIGHT - th_ + int(lf * th_ * 0.44)
+                base_y = min(HEIGHT, HEIGHT - th_ + int((lf + 1.0 / max(1, n_l - 1)) * th_ * 0.48))
+                lw     = int(tw_ * (0.28 + 0.72 * lf)) + 4
+                pts    = [
+                    (tx_ + t_rng.randint(-4, 4), tip_y),
+                    (tx_ - lw // 2 + t_rng.randint(-6, 6), base_y),
+                    (tx_ + lw // 2 + t_rng.randint(-6, 6), base_y),
+                ]
+                pygame.draw.polygon(s, TREE_COL, pts)
+            pygame.draw.rect(s, (4, 8, 4), (tx_ - 4, HEIGHT - 28, 8, 28))
 
-        # ── Coloured subtitle words ───────────────────────────────────────────
-        sub_y = title_y + 80
-        words = [("Grafo",      C["green"]),
-                 ("  •  ",      C["text_dim"]),
-                 ("Dijkstra",   C["blue"]),
-                 ("  •  ",      C["text_dim"]),
-                 ("AFD",        C["purple"]),
-                 ("  •  ",      C["text_dim"]),
+        # Ground fog
+        fog = pygame.Surface((WIDTH, 60), pygame.SRCALPHA)
+        for fi, fa in ((0, 48), (12, 34), (24, 20), (38, 10), (52, 3)):
+            pygame.draw.rect(fog, (14, 26, 12, fa), (0, fi, WIDTH, 14))
+        s.blit(fog, (0, HEIGHT - 60))
+
+        # ── Logo / Title ──────────────────────────────────────────────────────
+        if self._logo_surf:
+            lw, lh = self._logo_surf.get_size()
+            bob    = int(math.sin(t * 1.1) * 4)
+            logo_y = 25 + bob
+            # Drop shadow
+            shadow = self._logo_surf.copy()
+            shadow.set_alpha(55)
+            s.blit(shadow, (cx - lw // 2 + 5, logo_y + 7))
+            s.blit(self._logo_surf, (cx - lw // 2, logo_y))
+            title_y = logo_y + lh + 4
+            sub_offset = 12
+        else:
+            title_y   = 128
+            sub_offset = 60
+            self._title_glow(s, "VERTEX VALLEY", self.fonts["title"], C["green"], cx, title_y)
+
+        # ── TecnoUpsa badge (top-right, fixed) ───────────────────────────────
+        self._draw_tecnoupsa_badge(s, WIDTH - 90, 52)
+
+        # ── Subtitle keywords ─────────────────────────────────────────────────
+        sub_y = title_y + sub_offset
+        words = [("Grafo", C["green"]), ("  •  ", C["text_dim"]),
+                 ("Dijkstra", C["blue"]), ("  •  ", C["text_dim"]),
+                 ("AFD", C["purple"]), ("  •  ", C["text_dim"]),
                  ("Procedural", C["orange"])]
-        pieces = [(self.fonts["md"].render(w, True, c), c) for w, c in words]
-        total_w = sum(p.get_width() for p, _ in pieces)
-        sx = cx - total_w // 2
-        for p, _ in pieces:
-            s.blit(p, (sx, sub_y - p.get_height()//2))
-            sx += p.get_width()
-
-        # Decorative divider
-        div_y = sub_y + 26
-        pygame.draw.line(s, C["green_dk"], (cx-280, div_y), (cx+280, div_y), 1)
-        for dot_x in (cx-280, cx-140, cx, cx+140, cx+280):
-            pygame.draw.circle(s, C["green_dk"], (dot_x, div_y), 3)
+        pieces = [self.fonts["md"].render(w, True, c) for w, c in words]
+        total_w = sum(p.get_width() for p in pieces)
+        x_ = cx - total_w // 2
+        for p in pieces:
+            s.blit(p, (x_, sub_y - p.get_height() // 2))
+            x_ += p.get_width()
 
         # ── Seed input ────────────────────────────────────────────────────────
         seed_in = self.state_data.get("seed_input", "")
-        seed_y  = div_y + 28
-        box_r   = pygame.Rect(cx - 215, seed_y, 430, 48)
-        box_bg  = pygame.Surface((430, 48), pygame.SRCALPHA)
-        box_bg.fill((10, 16, 30, 225))
+        seed_y  = sub_y + 30
+        box_r   = pygame.Rect(cx - 180, seed_y, 360, 38)
+        box_bg  = pygame.Surface((360, 38), pygame.SRCALPHA)
+        box_bg.fill((4, 10, 20, 215))
         s.blit(box_bg, box_r.topleft)
-        bc = C["green"] if seed_in else C["border_hi"]
-        pygame.draw.rect(s, bc, box_r, 2, border_radius=10)
-        lbl = self.fonts["xs"].render("SEMILLA DEL MUNDO", True, C["text_dim"])
-        s.blit(lbl, (box_r.x + 12, box_r.y - 17))
-        disp = seed_in or "dejar en blanco = mundo aleatorio"
-        dc   = C["text_hi"] if seed_in else C["text_dim"]
-        dt   = self.fonts["md"].render(disp, True, dc)
-        s.blit(dt, (box_r.x + 14, box_r.y + (48 - dt.get_height())//2))
+        pygame.draw.rect(s, C["green"] if seed_in else C["border"], box_r, 1, border_radius=8)
+        lbl_s = self.fonts["xs"].render("SEMILLA DEL MUNDO", True, C["text_dim"])
+        s.blit(lbl_s, (box_r.x + 10, box_r.y - 14))
+        disp_s = self.fonts["sm"].render(
+            seed_in or "dejar en blanco = mundo aleatorio",
+            True, C["text_hi"] if seed_in else C["text_dim"])
+        s.blit(disp_s, disp_s.get_rect(midleft=(box_r.x + 10, box_r.centery)))
         if seed_in and int(t * 2) % 2 == 0:
             pygame.draw.rect(s, C["green"],
-                             (box_r.x + 14 + dt.get_width() + 3, box_r.y + 10, 2, 28))
+                             (box_r.x + 10 + disp_s.get_width() + 2, box_r.y + 6, 2, 26))
 
-        # ── Play button (glowing) ─────────────────────────────────────────────
-        btn_y   = seed_y + 64
-        btn_r   = pygame.Rect(cx - 230, btn_y, 460, 52)
-        pulse   = (math.sin(t * 2.5) + 1) / 2
-        # Outer glow
-        gr      = int(18 + pulse * 10)
-        gsurf   = pygame.Surface((btn_r.w + gr*2, btn_r.h + gr*2), pygame.SRCALPHA)
-        pygame.draw.rect(gsurf, (*C["green"], int(28 + pulse * 36)),
-                         gsurf.get_rect(), border_radius=18)
-        s.blit(gsurf, (btn_r.x - gr, btn_r.y - gr))
-        # Button face
-        btn_bg  = pygame.Surface((btn_r.w, btn_r.h), pygame.SRCALPHA)
-        btn_bg.fill((12, 60, 42, 240))
-        s.blit(btn_bg, btn_r.topleft)
-        pygame.draw.rect(s, C["green"], btn_r, 2, border_radius=10)
-        # Bright top edge (bevel)
-        pygame.draw.line(s, tuple(min(255,c+80) for c in C["green"]),
-                         (btn_r.x+6, btn_r.y+2), (btn_r.right-6, btn_r.y+2), 1)
-        # Text — render at sm size so it always fits inside the button
-        enter_c = C["green"] if int(t*1.5)%2==0 else tuple(min(255,c+60) for c in C["green"])
-        et = self.fonts["md"].render(">>  PRESIONA  ENTER  PARA  JUGAR  <<", True, enter_c)
-        # Fallback: if still wider than button, clip to button width
-        if et.get_width() > btn_r.w - 16:
-            et = self.fonts["sm"].render(">>  PRESIONA  ENTER  PARA  JUGAR  <<", True, enter_c)
-        s.blit(et, et.get_rect(center=btn_r.center))
-
-        # ── Info cards ────────────────────────────────────────────────────────
-        card_y = btn_y + 74
-        CARDS  = [
-            ("CONTROLES", C["blue"], [
-                ("WASD / Flechas", "moverse por el mapa"),
-                ("ENTER / SPACE",  "interactuar (cofres, salidas)"),
-                ("E",              "abrir inventario"),
-                ("Q",              "abrir tienda cercana"),
-                ("M / ESC",        "mapa del mundo (grafo)"),
-                ("1 / 2 / 3",      "atacar / defender / huir"),
-                ("F11",            "pantalla completa"),
-            ]),
-            ("FLUJO DE JUEGO", C["orange"], [
-                ("Inicio",         "apareces en la Aldea central"),
-                ("Explorar",       "WASD por el mapa 2D"),
-                ("M o ESC",        "abre el mapa-grafo del mundo"),
-                ("Clic + ENTER",   "selecciona destino -> Dijkstra"),
-                ("Combate",        "toca el ! o viaja por aristas"),
-                ("Victoria",       "llega al nodo final (nodo 8)"),
-                ("Semilla",        "mismo numero = mismo mundo"),
-            ]),
+        # ── Buttons ───────────────────────────────────────────────────────────
+        BW, BH, BGAP = 300, 46, 10
+        btn_start_y = seed_y + 54
+        BTNS_DEF = [
+            ("INICIAR  JUEGO", "start"),
+            ("CONTROLES",      "controls"),
+            ("SALIR",          "quit"),
         ]
-        card_w = 390
-        gap    = 28
-        total_cw = len(CARDS) * card_w + (len(CARDS)-1) * gap
-        cx0    = cx - total_cw // 2
+        mx_m, my_m = pygame.mouse.get_pos()
+        btn_rects: dict = {}
+        show_ctrl = self.state_data.get("show_controls", False)
+        for i, (label, key) in enumerate(BTNS_DEF):
+            by_ = btn_start_y + i * (BH + BGAP)
+            br_ = pygame.Rect(cx - BW // 2, by_, BW, BH)
+            btn_rects[key] = br_
+            hov = br_.collidepoint(mx_m, my_m) and not show_ctrl
+            if hov:
+                gw_s = pygame.Surface((BW + 14, BH + 14), pygame.SRCALPHA)
+                pygame.draw.rect(gw_s, (*C["green"], 40), gw_s.get_rect(), border_radius=12)
+                s.blit(gw_s, (br_.x - 7, br_.y - 7))
+            bg_ = pygame.Surface((BW, BH), pygame.SRCALPHA)
+            bg_.fill((16, 68, 52, 235) if hov else (6, 20, 16, 205))
+            s.blit(bg_, br_.topleft)
+            pygame.draw.rect(s, C["green"] if hov else C["border_hi"], br_,
+                             2 if hov else 1, border_radius=8)
+            bt_ = self.fonts["md"].render(label, True, C["green"] if hov else C["text"])
+            s.blit(bt_, bt_.get_rect(center=br_.center))
+        self._title_btns = btn_rects
 
-        for i, (c_title, c_col, c_items) in enumerate(CARDS):
-            card_h = 36 + len(c_items) * 20 + 14
-            cr     = pygame.Rect(cx0 + i*(card_w+gap), card_y, card_w, card_h)
-            # Background
-            bg_ = pygame.Surface((card_w, card_h), pygame.SRCALPHA)
-            bg_.fill((8, 10, 24, 215))
-            s.blit(bg_, cr.topleft)
-            # Coloured header strip
-            pygame.draw.rect(s, c_col, pygame.Rect(cr.x, cr.y, card_w, 30), border_radius=7)
-            pygame.draw.rect(s, tuple(min(255,c+50) for c in c_col),
-                             pygame.Rect(cr.x+2, cr.y+1, card_w-4, 12), border_radius=6)
-            ct_ = self.fonts["sm"].render(c_title, True, (6, 8, 18))
-            s.blit(ct_, ct_.get_rect(center=(cr.x + card_w//2, cr.y + 15)))
-            # Border
-            pygame.draw.rect(s, c_col, cr, 1, border_radius=8)
-            # Items
-            for j, (key, val) in enumerate(c_items):
-                iy = cr.y + 36 + j * 20
-                kt = self.fonts["xs"].render(key, True, c_col)
-                vt = self.fonts["xs"].render(val, True, C["text_dim"])
-                s.blit(kt, (cr.x + 12, iy))
-                s.blit(vt, (cr.x + 12 + kt.get_width() + 8, iy))
-
-        # ── Footer: semilla + créditos ────────────────────────────────────────
+        # ── Footer ────────────────────────────────────────────────────────────
+        pygame.draw.line(s, C["border"], (40, HEIGHT - 62), (WIDTH - 40, HEIGHT - 62), 1)
         seed_v = self.seed if hasattr(self, "seed") else "?"
-        pygame.draw.line(s, C["border"], (40, HEIGHT-60), (WIDTH-40, HEIGHT-60), 1)
-
-        # Semilla (pequeño, izquierda)
         sv = self.fonts["xs"].render(f"Semilla: {seed_v}", True, C["text_dim"])
-        s.blit(sv, (46, HEIGHT - 52))
-
-        # Créditos de autores (centrado, dos líneas)
+        s.blit(sv, (46, HEIGHT - 50))
         made = self.fonts["xs"].render("Made by:", True, C["text_dim"])
-        s.blit(made, made.get_rect(center=(cx, HEIGHT - 48)))
-
-        authors1 = self.fonts["sm"].render(
+        s.blit(made, made.get_rect(center=(cx, HEIGHT - 50)))
+        a1 = self.fonts["sm"].render(
             "Flavia Lozada Rueda   ·   Ma. Fernanda Sanchez", True, C["text"])
-        authors2 = self.fonts["sm"].render(
+        a2 = self.fonts["sm"].render(
             "Mateo Soto Gareca   ·   Carlos Zambrana", True, C["text"])
-        s.blit(authors1, authors1.get_rect(center=(cx, HEIGHT - 30)))
-        s.blit(authors2, authors2.get_rect(center=(cx, HEIGHT - 12)))
+        s.blit(a1, a1.get_rect(center=(cx, HEIGHT - 32)))
+        s.blit(a2, a2.get_rect(center=(cx, HEIGHT - 14)))
+
+        # ── Controls overlay ──────────────────────────────────────────────────
+        if show_ctrl:
+            self._draw_title_controls_overlay(s, cx)
+
+    def _draw_title_controls_overlay(self, s, cx):
+        """Panel con controles del juego — se muestra al presionar CONTROLES."""
+        dim = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 175))
+        s.blit(dim, (0, 0))
+
+        pw, ph = 780, 430
+        pr = pygame.Rect(cx - pw // 2, HEIGHT // 2 - ph // 2, pw, ph)
+        panel = pygame.Surface((pw, ph), pygame.SRCALPHA)
+        panel.fill((8, 12, 22, 250))
+        s.blit(panel, pr.topleft)
+        pygame.draw.rect(s, C["green"], pr, 2, border_radius=12)
+
+        tl = self.fonts["md"].render("CONTROLES  Y  FLUJO  DE  JUEGO", True, C["green"])
+        s.blit(tl, tl.get_rect(center=(cx, pr.y + 24)))
+        pygame.draw.line(s, C["border_hi"],
+                         (pr.x + 20, pr.y + 42), (pr.right - 20, pr.y + 42), 1)
+
+        CONTROLS_DATA = [
+            ("WASD / Flechas", "moverse por el mapa"),
+            ("ENTER / SPACE",  "interactuar (cofres, salidas)"),
+            ("E",              "abrir inventario"),
+            ("Q",              "abrir tienda cercana"),
+            ("M / ESC",        "mapa del mundo (grafo)"),
+            ("1 / 2 / 3",      "atacar / defender / huir"),
+            ("F11",            "pantalla completa"),
+        ]
+        FLUJO_DATA = [
+            ("Inicio",        "apareces en la Aldea central"),
+            ("Explorar",      "WASD por el mapa 2D"),
+            ("M o ESC",       "abre el mapa-grafo del mundo"),
+            ("Clic + ENTER",  "selecciona destino -> Dijkstra"),
+            ("Combate",       "toca el ! o viaja por aristas"),
+            ("Victoria",      "llega al nodo final (nodo 8)"),
+            ("Semilla",       "mismo numero = mismo mundo"),
+        ]
+        for ci, (hdr, col_c, rows) in enumerate([
+            ("CONTROLES",      C["blue"],   CONTROLS_DATA),
+            ("FLUJO  DE  JUEGO", C["orange"], FLUJO_DATA),
+        ]):
+            x_ = pr.x + 28 + ci * (pw // 2)
+            ht = self.fonts["sm"].render(hdr, True, col_c)
+            s.blit(ht, (x_, pr.y + 52))
+            for j, (key, val) in enumerate(rows):
+                iy = pr.y + 76 + j * 22
+                kt = self.fonts["xs"].render(key, True, col_c)
+                vt = self.fonts["xs"].render(val, True, C["text_dim"])
+                s.blit(kt, (x_, iy))
+                s.blit(vt, (x_ + kt.get_width() + 8, iy))
+
+        close_t = self.fonts["xs"].render(
+            "presiona  ESC  o  clic  para  cerrar", True, C["text_dim"])
+        s.blit(close_t, close_t.get_rect(center=(cx, pr.bottom - 18)))
 
     # ── world / dijkstra screens ──────────────────────────────────────────────
 
@@ -1041,7 +1158,8 @@ class Game:
         dijk_data = None
         self.graph_view.draw(
             self.graph, self.current_node_id,
-            self._selected_node, dijk_data, None
+            self._selected_node, dijk_data, None,
+            traveled_edges=self._traveled_edges
         )
         if self._selected_node is None:
             hint = "CLIC en un nodo para seleccionar destino   |   ESC: volver al mapa de exploracion"
@@ -1055,9 +1173,10 @@ class Game:
         self.graph_view.draw(
             self.graph, self.current_node_id,
             self._selected_node, data.get("step"),
-            data.get("target")
+            data.get("target"),
+            traveled_edges=self._traveled_edges
         )
-        step = data.get("step", {})
+        step = data.get("step") or {}
         if step.get("done"):
             hint = "Ruta óptima encontrada.  ESPACIO: continuar"
         else:
@@ -1316,27 +1435,40 @@ class Game:
 
         self.map_view.center_camera(self.player.x, self.player.y, self.tile_map)
         self.map_view.draw(self.tile_map, self.player, self._opened_objects)
-        # Floating damage numbers drawn above the map
-        self._draw_hurt_tiles()        # flash de color sobre tiles golpeados
+        self._draw_hurt_tiles()
         self._draw_walk_particles()
-        self._draw_enemy_hp_bars()     # barras de HP sobre monstruos dañados
+        self._draw_enemy_hp_bars()
         self._draw_hit_effects()
 
+        # Weather overlay (drawn after map, before HUD)
+        self.weather.draw(self.screen)
+
         if in_corridor:
-            # Show progress bar and corridor-specific HUD
             dest = self.graph.nodes[self._corridor_dest] if self._corridor_dest is not None else node
             dest_name = f"Corredor -> {dest.name}"
             prog = self.player.x / max(1, self.tile_map.cols - 1)
             self.hud.draw(self.player, dest_name, self.tile_map.node_type,
-                          f"WASD:avanzar  ENTER:actuar  [{int(prog*100)}% recorrido]")
+                          f"WASD:avanzar  ENTER:actuar  TAB:minimapa  [{int(prog*100)}% recorrido]")
             self._draw_corridor_progress(prog)
         else:
             self.hud.draw(
                 self.player, node.name, node.type,
-                "WASD:mover  ENTER:actuar  E:inv  Q:tienda  M/ESC:mapa  F11:pantalla-completa"
+                "WASD:mover  ENTER:actuar  E:inv  TAB:minimapa  M/ESC:mapa  F11:full"
             )
+        # Weather badge (bottom-left, above corridor bar)
+        self.weather.draw_hud_badge(
+            self.screen, self.fonts["sm"], self.fonts["xs"],
+            x=10, y=HEIGHT - 52
+        )
+
         if self.state_data.get("show_inv"):
             self._draw_inventory()
+        if self._show_minimap:
+            self.minimap.draw(
+                self.graph, self.current_node_id,
+                self._traveled_edges,
+                self._corridor_dest if in_corridor else None,
+            )
 
     def _draw_corridor_progress(self, progress: float):
         """Thin progress bar at bottom showing how far through the corridor the player is."""
@@ -1483,6 +1615,167 @@ class Game:
 
         ft = self.fonts["sm"].render("ENTER — cerrar", True, C["text_dim"])
         s.blit(ft, ft.get_rect(center=(sw // 2, py + ph - 30)))
+
+    # ── world events ─────────────────────────────────────────────────────────
+
+    # Event catalogue — each entry is (weight, builder_fn)
+    _EVENT_POOL = None  # built lazily
+
+    def _roll_node_event(self, node_id: int, node_type: str) -> "dict | None":
+        rng = random.Random(self.seed ^ node_id ^ 0xCAFE)
+        if rng.random() > 0.45:   # 45 % chance of an event on first visit
+            return None
+
+        roll = rng.random()
+        hp_restore = rng.randint(18, 32)
+        trap_dmg   = rng.randint(8, 18)
+        bonus_coin = rng.randint(12, 28)
+
+        if roll < 0.30:
+            return {
+                "kind":   "altar",
+                "title":  "Altar Sagrado",
+                "flavor": "Una piedra antigua emana luz tenue...\nUna fuerza desconocida restaura tus heridas.",
+                "effect": f"+{hp_restore} HP restaurado",
+                "color":  (120, 210, 160),
+                "hp":     hp_restore,
+                "applied": False,
+            }
+        elif roll < 0.55:
+            return {
+                "kind":    "merchant",
+                "title":   "Mercader Errante",
+                "flavor":  "Un extraño mercader surge de las sombras.\n'Tengo cosas interesantes para un viajero...'",
+                "effect":  "Visitar su tienda",
+                "color":   (240, 190, 60),
+                "applied": False,
+            }
+        elif roll < 0.80:
+            return {
+                "kind":   "trap",
+                "title":  "Trampa Antigua",
+                "flavor": "El suelo cede bajo tus pies.\nUn mecanismo oxidado te golpea antes de que reacciones.",
+                "effect": f"-{trap_dmg} HP",
+                "color":  (220, 80, 60),
+                "dmg":    trap_dmg,
+                "applied": False,
+            }
+        else:
+            return {
+                "kind":   "relic",
+                "title":  "Reliquia Misteriosa",
+                "flavor": "Una moneda extraña brilla en el suelo.\nParece valiosa... o maldita.",
+                "effect": f"+{bonus_coin} monedas",
+                "color":  (200, 160, 240),
+                "coins":  bonus_coin,
+                "applied": False,
+            }
+
+    def _ev_event(self, e: pygame.event.Event):
+        if e.type != pygame.KEYDOWN:
+            return
+        if e.key not in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE, pygame.K_ESCAPE):
+            return
+        ev = self.state_data.get("event", {})
+        if not ev.get("applied"):
+            self._apply_event(ev)
+            ev["applied"] = True
+        if ev.get("kind") == "merchant" and e.key != pygame.K_ESCAPE:
+            self.state_data = {}
+            self.state = STATE_SHOP
+        else:
+            self.state_data = {}
+            self.state = STATE_EXPLORE
+
+    def _apply_event(self, ev: dict):
+        kind = ev.get("kind")
+        if kind == "altar":
+            self.player.heal(ev.get("hp", 20))
+        elif kind == "trap":
+            self.player.take_damage(ev.get("dmg", 10))
+            if not self.player.is_alive():
+                self.state = STATE_GAME_OVER
+        elif kind == "relic":
+            self.player.coins += ev.get("coins", 15)
+
+    def _draw_event(self):
+        s  = self.screen
+        ev = self.state_data.get("event", {})
+        if not ev:
+            self.state = STATE_EXPLORE
+            return
+
+        # Draw the map underneath (atmosphere)
+        self._draw_explore()
+
+        # Dark vignette
+        veil = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        veil.fill((0, 0, 0, 165))
+        s.blit(veil, (0, 0))
+
+        kind  = ev.get("kind", "altar")
+        title = ev.get("title", "")
+        flavor = ev.get("flavor", "")
+        effect = ev.get("effect", "")
+        col   = ev.get("color", (200, 200, 200))
+        t     = self._anim_t
+
+        # Panel
+        pw, ph = 560, 320
+        px_, py_ = (WIDTH - pw) // 2, (HEIGHT - ph) // 2
+        panel = pygame.Surface((pw, ph), pygame.SRCALPHA)
+        panel.fill((10, 8, 6, 230))
+        pygame.draw.rect(panel, (*col, 180), pygame.Rect(0, 0, pw, ph), 2, border_radius=10)
+        # Corner ornaments
+        for cx_, cy_, ax, ay in [(8,8,1,1),(pw-8,8,-1,1),(8,ph-8,1,-1),(pw-8,ph-8,-1,-1)]:
+            pygame.draw.line(panel, col, (cx_, cy_), (cx_ + ax*18, cy_), 2)
+            pygame.draw.line(panel, col, (cx_, cy_), (cx_, cy_ + ay*18), 2)
+        s.blit(panel, (px_, py_))
+
+        # Icon circle (pulsing)
+        pulse = (math.sin(t * 2.8) + 1) / 2
+        icon_r = int(32 + pulse * 4)
+        ix, iy = px_ + pw // 2, py_ + 62
+        glow = pygame.Surface((icon_r * 4, icon_r * 4), pygame.SRCALPHA)
+        pygame.draw.circle(glow, (*col, int(30 + 20 * pulse)),
+                           (icon_r * 2, icon_r * 2), icon_r + 12)
+        s.blit(glow, (ix - icon_r * 2, iy - icon_r * 2))
+        pygame.draw.circle(s, tuple(int(c * 0.4) for c in col), (ix, iy), icon_r)
+        pygame.draw.circle(s, col, (ix, iy), icon_r, 2)
+        icons = {"altar": "+", "merchant": "$", "trap": "!", "relic": "?"}
+        it = self.fonts["lg"].render(icons.get(kind, "?"), True, col)
+        s.blit(it, it.get_rect(center=(ix, iy)))
+
+        # Title
+        tc = tuple(min(255, int(c * (0.85 + 0.15 * pulse))) for c in col)
+        tt = self.fonts["md"].render(title, True, tc)
+        s.blit(tt, tt.get_rect(centerx=px_ + pw // 2, y=py_ + 108))
+
+        # Horizontal rule
+        pygame.draw.line(s, (*col, 100), (px_ + 30, py_ + 138), (px_ + pw - 30, py_ + 138), 1)
+
+        # Flavor text (wrapped manually at ~50 chars)
+        lines = flavor.split("\n")
+        yy = py_ + 150
+        for line in lines:
+            ft = self.fonts["xs"].render(line, True, (190, 185, 170))
+            s.blit(ft, ft.get_rect(centerx=px_ + pw // 2, y=yy))
+            yy += 18
+
+        # Effect badge
+        yy += 8
+        eff_col = col
+        et = self.fonts["sm"].render(effect, True, eff_col)
+        s.blit(et, et.get_rect(centerx=px_ + pw // 2, y=yy))
+
+        # Confirm hint (blinking)
+        if int(t * 2) % 2 == 0:
+            if kind == "merchant":
+                hint = "ENTER: visitar tienda   |   ESC: ignorar"
+            else:
+                hint = "ENTER / ESPACIO: continuar"
+            ht = self.fonts["xs"].render(hint, True, (140, 130, 110))
+            s.blit(ht, ht.get_rect(centerx=px_ + pw // 2, y=py_ + ph - 28))
 
     # ── game over / win ───────────────────────────────────────────────────────
 
@@ -1777,9 +2070,12 @@ class Game:
         c, r = self.player.x, self.player.y
         for dc, dr in ((0,0),(1,0),(-1,0),(0,1),(0,-1)):
             nc, nr = c+dc, r+dr
-            if (self.tile_map.get_object(nc, nr) == 'enemy' and
-                    (nc, nr) not in self._opened_objects):
-                self._do_quick_hit(nc, nr)
+            obj = self.tile_map.get_object(nc, nr)
+            if obj in ('enemy', 'werewolf') and (nc, nr) not in self._opened_objects:
+                if obj == 'werewolf':
+                    self._start_werewolf_combat(nc, nr)
+                else:
+                    self._do_quick_hit(nc, nr)
                 return
         self._notify("No hay monstruo cerca  [ K = golpear ]", C["text_dim"], 1.0)
 
@@ -1889,7 +2185,7 @@ class Game:
 
     def _finish_dijkstra(self):
         data   = self.state_data
-        step   = data.get("step", {})
+        step   = data.get("step") or {}
         path   = step.get("path", [self.current_node_id, data["target"]])
         target = path[-1]
 
@@ -1911,6 +2207,7 @@ class Game:
 
         # Load corridor as the active map
         self._corridor_dest    = target
+        self._corridor_path    = path
         self._enemy_move_timer = 0.0
         self.tile_map          = corridor
         px, py                 = corridor.player_start
@@ -1933,12 +2230,17 @@ class Game:
             # Travel complete — load destination
             path   = data["path"]
             target = path[-1]
+            for i in range(len(path) - 1):
+                a, b = path[i], path[i + 1]
+                self._traveled_edges.add((min(a, b), max(a, b)))
             self._load_node(target)
             self._selected_node = None
-            node   = self.graph.nodes[target]
-            # Win condition: reach node 8 (the final node)
             if target == len(self.graph.nodes) - 1:
                 self.state = STATE_WIN
+            elif self._pending_event:
+                self.state_data = {"event": self._pending_event}
+                self._pending_event = None
+                self.state = STATE_EVENT
             else:
                 self.state = STATE_EXPLORE
             return
@@ -1977,6 +2279,8 @@ class Game:
         elif obj == "enemy" and (c, r) not in self._opened_objects:
             # Combate directo en el mapa — sin abrir pantalla separada
             self._do_quick_hit(c, r)
+        elif obj == "werewolf" and (c, r) not in self._opened_objects:
+            self._start_werewolf_combat(c, r)
 
     def _start_node_combat(self, c: int, r: int):
         self._opened_objects.add((c, r))
@@ -1986,6 +2290,17 @@ class Game:
         enemy = make_enemy(node.type, 1.0 + self.player.level * 0.08)
         self._combat   = CombatSystem(self.player, enemy)
         self.state_data = {"post_combat_state": STATE_EXPLORE}
+        self.state = STATE_COMBAT
+
+    def _start_werewolf_combat(self, c: int, r: int):
+        """Inicia combate completo contra el Hombre Lobo boss."""
+        self._opened_objects.add((c, r))
+        self.tile_map.remove_object(c, r)
+        self.player.is_moving = False
+        enemy = make_werewolf(1.0 + self.player.level * 0.12)
+        self._combat   = CombatSystem(self.player, enemy)
+        self.state_data = {"post_combat_state": STATE_EXPLORE}
+        self._notify("¡HOMBRE LOBO! ¡Prepárate!", C["red"], 2.2)
         self.state = STATE_COMBAT
 
     def _exit_to_nearest(self):
@@ -2011,6 +2326,7 @@ class Game:
         )
 
         self._corridor_dest    = target
+        self._corridor_path    = [self.current_node_id, target]
         self._enemy_move_timer = 0.0
         self._map_enemies      = {}
         self._hit_effects      = []
@@ -2031,12 +2347,20 @@ class Game:
         target = self._corridor_dest
         if target is None:
             return
+        for i in range(len(self._corridor_path) - 1):
+            a, b = self._corridor_path[i], self._corridor_path[i + 1]
+            self._traveled_edges.add((min(a, b), max(a, b)))
+        self._corridor_path = []
         self._load_node(target)
         dest = self.graph.nodes[target]
         self._notify(f"Llegaste a {dest.name}!", C["green"], 3.5)
         self._corridor_dest = None
         if target == len(self.graph.nodes) - 1:
             self.state = STATE_WIN
+        elif self._pending_event:
+            self.state_data = {"event": self._pending_event}
+            self._pending_event = None
+            self.state = STATE_EVENT
         else:
             self.state = STATE_EXPLORE
 

@@ -458,6 +458,18 @@ class TileMap:
                 if placed >= count:
                     break
 
+        # Hombre Lobo boss — siempre presente en mapas de bosque
+        if self.node_type == TYPE_FOREST:
+            px, py = self.player_start
+            for _ in range(60):
+                c = self.rng.randint(6, self.cols - 6)
+                r = self.rng.randint(6, self.rows - 6)
+                if abs(c - px) + abs(r - py) < 10:
+                    continue
+                if (c, r) not in self.objects and self.is_walkable(c, r):
+                    self.objects[(c, r)] = "werewolf"
+                    break
+
     def _safe_set(self, r: int, c: int, tile: int):
         if 0 <= r < self.rows and 0 <= c < self.cols:
             self.tiles[r][c] = tile

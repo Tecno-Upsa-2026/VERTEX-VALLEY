@@ -5,6 +5,9 @@ import math
 import pygame
 from config import C
 from core.afd import S, DELTA
+from entities import werewolf_sprite as _wws
+from entities import troll_sprite    as _trs
+from entities import slime_sprite    as _sls
 
 
 class CombatUI:
@@ -128,11 +131,20 @@ class CombatUI:
             s.blit(bt, bt.get_rect(center=rect.center))
 
     def _draw_enemy_sprite(self, name: str, cx: int, cy: int, size: int):
-        """Draw a stylised enemy box with pseudo-sprite."""
+        """Draw enemy sprite — usa sprite sheet para Hombre Lobo, Troll y Slime."""
+        if name == "Hombre Lobo":
+            self._draw_werewolf_combat(cx, cy, size)
+            return
+        if name == "Troll":
+            self._draw_troll_combat(cx, cy, size)
+            return
+        if name == "Slime":
+            self._draw_slime_combat(cx, cy, size)
+            return
+
         s   = self.screen
         t   = self._anim_t
         hw  = size // 2
-        hh  = int(size * 0.65)
         r   = pygame.Rect(cx - hw, cy, size, int(size * 1.3))
 
         # glow
@@ -156,6 +168,126 @@ class CombatUI:
         # Name tag
         nt = self.F["lg"].render(name, True, (220, 80, 80))
         s.blit(nt, nt.get_rect(center=(cx, cy + int(size * 1.35) + bob + 10)))
+
+    def _draw_werewolf_combat(self, cx: int, cy: int, size: int):
+        """Renderiza al Hombre Lobo en la pantalla de combate usando el sprite sheet."""
+        s  = self.screen
+        t  = self._anim_t
+        sw = int(size * 0.78)   # tamaño del sprite en pantalla
+
+        # Ciclo de animaciones: rest → charge → attack → rest (6 seg)
+        cycle = t % 6.0
+        if self._shake > 0.05:
+            anim = "scream"
+        elif cycle < 2.0:
+            anim = "rest"
+        elif cycle < 3.0:
+            anim = "going_for_attack"
+        elif cycle < 5.0:
+            anim = "attack"
+        else:
+            anim = "rest"
+
+        surf = _wws.frame_for_t(anim, t, sw, sw)
+        if surf is not None:
+            # Glow rojo detrás del sprite
+            glow = pygame.Surface((sw + 60, sw + 60), pygame.SRCALPHA)
+            ga   = 18 + int(12 * math.sin(t * 2))
+            pygame.draw.ellipse(glow, (200, 50, 50, ga), glow.get_rect())
+            s.blit(glow, (cx - sw // 2 - 30, cy - sw // 4 - 30))
+            s.blit(surf, (cx - sw // 2, cy - sw // 4))
+            nt = self.F["lg"].render("Hombre Lobo", True, (220, 80, 80))
+            s.blit(nt, nt.get_rect(center=(cx, cy + sw * 3 // 4 + 14)))
+            return
+
+        # Fallback si el PNG no está disponible: caja genérica con nombre
+        hw  = size // 2
+        r   = pygame.Rect(cx - hw, cy, size, int(size * 1.3))
+        bob = int(math.sin(t * 1.8) * 4)
+        glow = pygame.Surface((size + 40, int(size * 1.3) + 40), pygame.SRCALPHA)
+        pygame.draw.ellipse(glow, (200, 50, 50, 22), glow.get_rect())
+        s.blit(glow, (r.x - 20, r.y - 20))
+        pygame.draw.rect(s, (60, 30, 15), r.move(0, bob), border_radius=18)
+        pygame.draw.rect(s, (180, 80, 30), r.move(0, bob), 2, border_radius=18)
+        ey = cy + int(size * 0.25) + bob
+        for ex_off in (-hw // 3, hw // 3):
+            pygame.draw.circle(s, (255, 160, 20), (cx + ex_off, ey), 10)
+            pygame.draw.circle(s, (20, 5, 5),     (cx + ex_off + 2, ey + 2), 5)
+        nt = self.F["lg"].render("Hombre Lobo", True, (220, 100, 40))
+        s.blit(nt, nt.get_rect(center=(cx, cy + int(size * 1.35) + bob + 10)))
+
+    # ── helpers: pick animation based on recent hit direction ─────────────────
+
+    def _combat_anim(self, idle: str, attack: str, hurt: str) -> str:
+        """Returns the appropriate animation name based on last combat event."""
+        if self._last_dmg:
+            _val, hit_player, timer = self._last_dmg
+            if timer > 0.65:
+                return attack if hit_player else hurt
+        return idle
+
+    # ── Troll ─────────────────────────────────────────────────────────────────
+
+    def _draw_troll_combat(self, cx: int, cy: int, size: int):
+        s   = self.screen
+        t   = self._anim_t
+        sw  = int(size * 0.65)          # display size — Troll is big
+
+        anim = self._combat_anim("idle", "attack", "hurt")
+        surf = _trs.frame_for_t(anim, t, sw, sw)
+
+        if surf is not None:
+            glow = pygame.Surface((sw + 60, sw + 60), pygame.SRCALPHA)
+            ga   = 16 + int(10 * math.sin(t * 1.8))
+            pygame.draw.ellipse(glow, (140, 90, 40, ga), glow.get_rect())
+            s.blit(glow, (cx - sw // 2 - 30, cy - sw // 4 - 30))
+            s.blit(surf, (cx - sw // 2, cy - sw // 4))
+            nt = self.F["lg"].render("Troll", True, (180, 120, 60))
+            s.blit(nt, nt.get_rect(center=(cx, cy + sw * 3 // 4 + 14)))
+            return
+
+        # Fallback procedural
+        hw  = size // 2
+        r   = pygame.Rect(cx - hw, cy, size, int(size * 1.2))
+        bob = int(math.sin(t * 1.4) * 5)
+        pygame.draw.rect(s, (90, 55, 25), r.move(0, bob), border_radius=14)
+        pygame.draw.rect(s, (160, 100, 50), r.move(0, bob), 2, border_radius=14)
+        nt = self.F["lg"].render("Troll", True, (180, 120, 60))
+        s.blit(nt, nt.get_rect(center=(cx, cy + int(size * 1.3) + bob)))
+
+    # ── Slime ─────────────────────────────────────────────────────────────────
+
+    def _draw_slime_combat(self, cx: int, cy: int, size: int):
+        s   = self.screen
+        t   = self._anim_t
+        # Slime frames are wide + short: display as wide rectangle
+        sw_w = int(size * 0.72)         # display width
+        sw_h = int(sw_w * 0.42)         # ~42 % height keeps natural aspect
+
+        anim = self._combat_anim("idle", "attack", "hurt")
+        surf = _sls.frame_for_t(anim, t, sw_w, sw_h)
+
+        if surf is not None:
+            glow = pygame.Surface((sw_w + 40, sw_h + 40), pygame.SRCALPHA)
+            ga   = 14 + int(8 * math.sin(t * 2.2))
+            pygame.draw.ellipse(glow, (60, 160, 40, ga), glow.get_rect())
+            # Position: centre the sprite, sit it on "ground" near centre of panel
+            sx = cx - sw_w // 2
+            sy = cy + int(size * 0.25)
+            s.blit(glow, (sx - 20, sy - 20))
+            s.blit(surf, (sx, sy))
+            nt = self.F["lg"].render("Slime", True, (80, 200, 60))
+            s.blit(nt, nt.get_rect(center=(cx, sy + sw_h + 14)))
+            return
+
+        # Fallback procedural
+        hw  = size // 2
+        bob = int(math.sin(t * 2.5) * 3)
+        r   = pygame.Rect(cx - hw, cy + int(size * 0.4), size, int(size * 0.5))
+        pygame.draw.ellipse(s, (40, 130, 30), r.move(0, bob))
+        pygame.draw.ellipse(s, (80, 200, 60), r.move(0, bob), 2)
+        nt = self.F["lg"].render("Slime", True, (80, 200, 60))
+        s.blit(nt, nt.get_rect(center=(cx, r.bottom + bob + 10)))
 
     def _draw_bar(self, surf, x, y, w, h, ratio, fill, bg, label):
         pygame.draw.rect(surf, bg, (x, y, w, h), border_radius=4)

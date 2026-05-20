@@ -13,6 +13,7 @@ STATE_EXPLORE  = "explore"
 STATE_COMBAT   = "combat"
 STATE_SHOP     = "shop"
 STATE_CHEST    = "chest"
+STATE_EVENT    = "event"
 STATE_GAME_OVER= "game_over"
 STATE_WIN      = "win"
 
@@ -134,7 +135,8 @@ NODE_SUFFIXES = [
 ENEMY_POOL = {
     TYPE_VILLAGE:  [("Ladrón",        10,  5, 1,  5,  3,  8)],
     TYPE_FOREST:   [("Lobo",          15,  7, 2,  8,  4, 10),
-                    ("Jabalí",        12,  6, 3,  7,  3,  8)],
+                    ("Jabalí",        12,  6, 3,  7,  3,  8),
+                    ("Hombre Lobo",   45, 14, 4, 30, 12, 28)],
     TYPE_CAVE:     [("Esqueleto",     18,  9, 3, 12,  6, 15),
                     ("Slime",         12,  4, 1,  8,  4, 10),
                     ("Murciélago",    10,  6, 2,  7,  3,  8)],
