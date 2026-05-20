@@ -35,6 +35,19 @@ class Enemy:
         return self.hp / self.max_hp
 
 
+def make_werewolf(difficulty: float = 1.0) -> Enemy:
+    """Crea al Hombre Lobo boss con stats escalados por dificultad."""
+    return Enemy(
+        name    = "Hombre Lobo",
+        max_hp  = max(20, int(45 * difficulty)),
+        attack  = max(8,  int(14 * difficulty)),
+        defense = 4,
+        exp     = max(10, int(30 * difficulty)),
+        coin_lo = 12,
+        coin_hi = 28,
+    )
+
+
 def make_enemy(node_type: str, difficulty: float = 1.0) -> Enemy:
     pool = ENEMY_POOL.get(node_type, ENEMY_POOL["forest"])
     tpl  = random.choice(pool)

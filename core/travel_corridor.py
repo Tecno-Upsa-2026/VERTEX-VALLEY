@@ -9,6 +9,9 @@ from config import (
     TYPE_FOREST, TYPE_CAVE, TYPE_MOUNTAIN, TYPE_LAKE, TYPE_VILLAGE,
 )
 
+# Biomas que pueden generar un encuentro con el Hombre Lobo
+_WEREWOLF_BIOMES = {TYPE_FOREST}
+
 # Tiles de pared y suelo por bioma
 _WALL = {
     TYPE_FOREST:   TILE_TREE,
@@ -99,6 +102,15 @@ class TravelCorridor:
                 er = self.WALL_H + rng.randint(0, self.WALK_H - 1)
                 if self.is_walkable(ec, er) and (ec, er) not in self.objects:
                     self.objects[(ec, er)] = 'enemy'
+                    break
+
+        # ── Hombre Lobo en corredores de bosque ─────────────────────────────────
+        if source_type in _WEREWOLF_BIOMES or dest_type in _WEREWOLF_BIOMES:
+            for _ in range(30):
+                wc = rng.randint(length // 3, 2 * length // 3)
+                wr = self.WALL_H + rng.randint(0, self.WALK_H - 1)
+                if self.is_walkable(wc, wr) and (wc, wr) not in self.objects:
+                    self.objects[(wc, wr)] = 'werewolf'
                     break
 
         # ── Un cofre en el tercio medio ──────────────────────────────────────
